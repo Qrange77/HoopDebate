@@ -9,6 +9,7 @@ import litellm
 import uvicorn
 from fastapi import FastAPI, Cookie, Depends, HTTPException, Response
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from tools import TOOLS, run_tool
@@ -144,6 +145,8 @@ def save_history(owner, record):
 # --- FastAPI App ---
 
 app = FastAPI()
+FRONTEND_DIST = Path(__file__).parent / "frontend" / "dist"
+app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets", check_dir=False), name="frontend-assets")
 
 
 class ChatRequest(BaseModel):
@@ -159,7 +162,14 @@ class ChatResponse(BaseModel):
 
 @app.get("/")
 def index():
-    return FileResponse(Path(__file__).parent / "index.html")
+    if not (FRONTEND_DIST / "index.html").is_file():
+        raise HTTPException(503, "Build the frontend first: cd frontend && npm ci && npm run build")
+    return FileResponse(FRONTEND_DIST / "index.html", headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/favicon.svg")
+def favicon():
+    return FileResponse(Path(__file__).parent / "frontend" / "public" / "favicon.svg")
 
 
 @app.get("/sessions")

@@ -15,7 +15,23 @@ transparent single-game advanced statistics. Built with FastAPI, LiteLLM, and Ge
    (older docs and the endpoint itself still call it Vertex AI)
 2. `gcloud auth application-default login`. The app uses your gcloud default
    project, so run `gemini-hello-world` first to check it.
-3. `uv run app.py`, then open http://localhost:8000
+3. Build the Vue frontend: `cd frontend && npm ci && npm run build`, then return
+   to the repository root with `cd ..`.
+4. `uv run app.py`, then open http://localhost:8000
+
+## Frontend
+
+The interface uses Vue 3, TypeScript, Vite, and the free TailAdmin Vue theme with
+Tailwind CSS v4. It includes searchable conversation history in the left sidebar,
+a chat workspace, dark/light themes, responsive mobile navigation, prompt starters,
+collapsed tool logs, Markdown-formatted assistant replies, and final player/team panels. Source and attribution are in
+`frontend/` and `frontend/THIRD-PARTY-NOTICES.md`.
+
+For frontend development, keep the Python server running on port 8000 and run
+`npm run dev` in `frontend/`. Vite proxies the existing chat/session endpoints to
+FastAPI. For the single-server app at port 8000, rebuild with `npm run build` after
+frontend changes. The build also runs TypeScript checks. No Node server is needed
+to serve the production build, and fonts are bundled locally.
 
 ## Tools
 
@@ -141,7 +157,9 @@ The frontend displays these panels after the final answer, never for intermediat
 
 Panels support ESPN headshots with a missing-image fallback and expandable metric
 formulas/inputs. Raw tool calls remain in collapsed logs. Text is rendered safely as
-text, and image URLs are restricted to HTTPS ESPN headshots.
+text for user messages and tool logs. Assistant replies use Markdown with raw HTML
+disabled; unsafe link schemes are rejected and inline Markdown images are shown
+as their descriptions. Panel image URLs are restricted to HTTPS ESPN headshots.
 
 Try these independent queries:
 
@@ -151,11 +169,14 @@ Try these independent queries:
 
 ## Saved conversations
 
-Click **New chat** to start with fresh context without deleting previous chats.
-Use the **Saved conversations** dropdown to reopen a conversation and continue it,
+Click **New conversation** to start with fresh context without deleting previous chats.
+Use the **Your conversations** sidebar to search, reopen a conversation, and continue it,
 including its previous answers, tool logs, photos, and metric cards. Empty new
 chats are saved only after the first message. Refreshing opens a blank chat; saved
-conversations remain available in the dropdown.
+conversations remain available in the sidebar. On mobile, use the menu button to open it.
+Use the trash button beside a conversation to permanently delete that saved chat.
+Deleting the open conversation returns the chat area to a new conversation;
+deleting another conversation leaves the current chat and draft intact.
 
 History is stored on the machine running the server in
 `chat_history/<browser-id>/<session-id>.json` and is excluded from Git. Each file

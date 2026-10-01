@@ -1,0 +1,25 @@
+{
+  "name": "nba-game-lab-ui",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "vue-tsc --noEmit && vite build",
+    "preview": "vite preview --host 127.0.0.1"
+  },
+  "dependencies": {
+    "@fontsource/outfit": "^5.2.8",
+    "lucide-vue-next": "^0.474.0",
+    "markdown-it": "^15.0.2",
+    "vue": "^3.5.26"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.18",
+    "@vitejs/plugin-vue": "^5.2.4",
+    "tailwindcss": "^4.1.18",
+    "typescript": "~5.7.3",
+    "vite": "^6.4.3",
+    "vue-tsc": "^2.2.12"
+  }
+}
