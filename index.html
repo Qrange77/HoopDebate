@@ -98,6 +98,8 @@
             .intro { padding: 1.5rem 2rem; border-bottom: 1px solid #e0e0e0; }
             .intro h1 { font-size: 1.4rem; margin-bottom: .5rem; }
             .intro p { color: #555; line-height: 1.5; }
+            .chat-nav { display: flex; gap: .75rem; padding: 1rem; border-bottom: 1px solid #ddd; }
+            #history { flex: 1; min-width: 0; padding: .5rem; }
             .content { white-space: pre-wrap; overflow-wrap: anywhere; }
             .result-card { border: 1px solid #ddd; border-radius: 12px; padding: 1rem; width: 100%; }
             .player-header { display: flex; align-items: center; gap: 1rem; margin-bottom: .75rem; }
@@ -133,6 +135,10 @@
                 <p>Explore games, player profiles, and single-game efficiency.</p>
                 <p>Try: "Show Paolo Banchero's photo and advanced stats against Memphis on January 15, 2026."</p>
             </header>
+            <nav class="chat-nav" aria-label="Conversations">
+                <button id="new-chat">New chat</button>
+                <select id="history" aria-label="Saved conversations"><option value="">New conversation</option></select>
+            </nav>
             <div id="messages" aria-live="polite"></div>
             <div id="input-area">
                 <input
@@ -150,6 +156,68 @@
             const userInput = document.getElementById("user-input");
             const sendBtn = document.getElementById("send-btn");
             let sessionId = null;
+            const newChat = document.getElementById("new-chat");
+            const history = document.getElementById("history");
+            function busy(value) {
+                sendBtn.disabled = value;
+                newChat.disabled = value;
+                history.disabled = value;
+            }
+            async function request(url, options) {
+                const res = await fetch(url, options);
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.detail || "Request failed");
+                return data;
+            }
+            async function refreshHistory() {
+                const records = await request("/sessions");
+                history.replaceChildren(new Option("New conversation", ""));
+                for (const record of records) history.add(new Option(record.title, record.session_id));
+                history.value = sessionId || "";
+            }
+            function showCalls(calls, before) {
+                for (const call of calls || []) {
+                    const div = element("details", "tool");
+                    div.append(element("summary", "", "Tool call: " + call.name));
+                    div.append(element("div", "", JSON.stringify(call.args, null, 2) + "\n" + call.result));
+                    messages.insertBefore(div, before);
+
+                }
+            }
+            function showPanels(calls, answer) {
+                let anchor = answer;
+                for (const call of calls || []) {
+                    const card = renderPanel(call);
+                    if (card) { anchor.after(card); anchor = card; }
+                }
+            }
+            newChat.addEventListener("click", () => {
+                sessionId = null;
+                history.value = "";
+                messages.replaceChildren();
+                userInput.value = "";
+                userInput.focus();
+            });
+            history.addEventListener("change", async () => {
+                if (!history.value) { newChat.click(); return; }
+                busy(true);
+                try {
+                    const record = await request("/sessions/" + history.value);
+                    sessionId = record.session_id;
+                    messages.replaceChildren();
+                    userInput.value = "";
+                    for (const turn of record.turns) {
+                        addMessage("you", turn.message);
+                        const answer = addMessage("assistant", turn.response);
+                        showCalls(turn.tool_calls, answer);
+                        showPanels(turn.tool_calls, answer);
+                    }
+                    messages.scrollTop = messages.scrollHeight;
+                } catch (e) {
+                    history.value = sessionId || "";
+                    addMessage("assistant", "Error: " + e.message);
+                } finally { busy(false); }
+            });
 
             function addMessage(role, text, isLoading = false) {
                 const div = document.createElement("div");
@@ -185,8 +253,8 @@
                 return null;
             }
 
-            function renderResult(call, before) {
-                if (!["player_info", "player_advanced_stats", "team_advanced_stats"].includes(call.name)) return;
+            function renderPanel(call) {
+                if (call.name !== "display_panel") return;
                 let result;
                 try { result = typeof call.result === "string" ? JSON.parse(call.result) : call.result; }
                 catch (_) { return; }
@@ -236,7 +304,7 @@
                     card.append(grid);
                 }
                 if (result.note) card.append(element("p", "result-note", result.note));
-                messages.insertBefore(card, before);
+                return card;
             }
 
             async function send() {
@@ -244,12 +312,12 @@
                 if (!text || sendBtn.disabled) return;
 
                 userInput.value = "";
-                sendBtn.disabled = true;
+                busy(true);
                 addMessage("you", text);
                 const loading = addMessage("assistant", "Thinking...", true);
 
                 try {
-                    const res = await fetch("/chat", {
+                    const data = await request("/chat", {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
                         body: JSON.stringify({
@@ -257,27 +325,21 @@
                             session_id: sessionId,
                         }),
                     });
-                    const data = await res.json();
                     sessionId = data.session_id;
 
-                    // Show each tool the harness ran, above the assistant's answer
-                    for (const call of data.tool_calls || []) {
-                        const div = element("details", "tool");
-                        div.append(element("summary", "", "Tool call: " + call.name));
-                        div.append(element("div", "", JSON.stringify(call.args, null, 2) + "\n" + call.result));
-                        messages.insertBefore(div, loading);
-                        renderResult(call, loading);
-                    }
+                    showCalls(data.tool_calls, loading);
                     loading.querySelector(".content").textContent =
                         data.response;
                     loading.classList.remove("loading");
+                    showPanels(data.tool_calls, loading);
+                    await refreshHistory();
                 } catch (e) {
                     loading.querySelector(".content").textContent =
                         "Error: " + e.message;
                     loading.classList.remove("loading");
                 }
                 messages.scrollTop = messages.scrollHeight;
-                sendBtn.disabled = false;
+                busy(false);
                 userInput.focus();
             }
 
@@ -285,7 +347,9 @@
             userInput.addEventListener("keydown", function (e) {
                 if (e.key === "Enter") send();
             });
-            userInput.focus();
+            busy(true);
+            refreshHistory().catch(e => addMessage("assistant", "Unable to load history: " + e.message))
+                .finally(() => { busy(false); userInput.focus(); });
         </script>
     </body>
 </html>

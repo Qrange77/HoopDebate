@@ -8,6 +8,7 @@ from functools import wraps
 from zoneinfo import ZoneInfo
 
 import requests
+from pydantic import BaseModel, ConfigDict, Field
 
 from advanced_stats import PLAYER_METRICS, TEAM_METRICS, calculate, shooting_inputs
 
@@ -15,6 +16,7 @@ NBA_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba"
 TOOLS = []
 TOOL_MAP = {}
 PARAMETERS = {
+    "panel": "Final display data copied from previous tool results: player/team, optional headshot and metrics. Do not invent values; include formulas, inputs, caveats and provisional status. No fetching or calculation occurs.",
     "metric": "Metric name or all (default). Player: efg_pct, ts_pct, game_score, ast_to_ratio, three_point_attempt_rate, free_throw_rate. Team additionally supports tov_pct, oreb_pct, estimated_possessions, offensive_rating, defensive_rating, net_rating, but not game_score or ast_to_ratio.",
     "date": "Game date YYYY-MM-DD. Defaults to today in America/New_York when event_id is omitted.",
     "event_id": "ESPN game ID returned by find_games. Can be used without date.",
@@ -35,6 +37,29 @@ class LookupIssue(Exception):
         self.result = {"message": message, **details}
 
 
+class PanelMetric(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    label: str
+    value: float | None
+    unit: str
+    formula: str = ""
+    inputs: dict[str, float | None] = Field(default_factory=dict)
+    estimated: bool = False
+    unavailable_reason: str | None = None
+
+
+class PanelData(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    player: str = ""
+    team: str = ""
+    headshot: str | None = None
+    position: str | None = None
+    jersey: str | None = None
+    metrics: dict[str, PanelMetric] = Field(default_factory=dict)
+    provisional: bool = False
+    note: str = ""
+
+
 def nba_tool(fn):
     """Register a typed function and give every public tool a JSON/error boundary."""
     signature = inspect.signature(fn)
@@ -42,6 +67,11 @@ def nba_tool(fn):
     for name, param in signature.parameters.items():
         spec = {"type": "integer" if param.annotation is int else "string",
                 "description": PARAMETERS[name]}
+        if param.annotation is dict:
+            spec = PanelData.model_json_schema()
+            definitions = spec.pop("$defs", {})
+            spec["properties"]["metrics"]["additionalProperties"] = definitions["PanelMetric"]
+            spec["description"] = PARAMETERS[name]
         if param.default is inspect.Parameter.empty:
             required.append(name)
         else:
@@ -496,6 +526,47 @@ def team_advanced_stats(team_name: str, date: str = "", event_id: str = "", metr
     return {"team": team["displayName"], "metrics": calculate(inputs, TEAM_METRICS, metric),
             "provisional": provisional,
             "note": "Calculated locally. Possessions use the average of both teams' (FGA + 0.44*FTA - OREB + TO), including overtime. TS%, TOV%, possessions and ratings are estimates, not official NBA possession counts or ratings. Rebound percentage uses box-score rebound totals."}
+
+
+@nba_tool
+def game_players(date: str = "", event_id: str = "", team_name: str = ""):
+    """List players in one game's box score: IDs, names, teams, and did-not-play status. Optionally filter by team. No statistics or rankings; use player_advanced_stats separately for each player."""
+    data, competition = _game(date, event_id, team_name)
+    squads = data.get("boxscore", {}).get("players", [])
+    expected = competition.get("competitors", [])
+    if team_name:
+        expected = [_choose(expected, team_name, "team")]
+    expected_ids = {str(c["team"]["id"]) for c in expected}
+    players, present, seen = [], set(), set()
+    for squad in squads:
+        team = squad.get("team", {})
+        if str(team.get("id")) not in expected_ids:
+            continue
+        for group in squad.get("statistics", []):
+            for row in group.get("athletes", []):
+                athlete = row.get("athlete", {})
+                if not athlete.get("displayName"):
+                    continue
+                present.add(str(team.get("id")))
+                identity = (team.get("id"), athlete.get("id", athlete["displayName"]))
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                players.append({"player_id": athlete.get("id"), "player_name": athlete["displayName"],
+                                "team_name": team.get("displayName"), "did_not_play": row.get("didNotPlay")})
+    missing = [c["team"]["displayName"] for c in expected if str(c["team"]["id"]) not in present]
+    return {"event_id": str(competition.get("id") or event_id), "players": players,
+            "complete": bool(expected_ids) and not missing, "missing_teams": missing,
+            "note": "Lists available game box-score entries, not a season roster. Missing teams mean incomplete coverage."}
+
+
+@nba_tool
+def display_panel(panel: dict):
+    """Prepare an optional visual panel for the FINAL answer only. Call after completing research, only when a visual is requested or useful for the selected final result. Pass previously retrieved data; this tool does not fetch, calculate, rank or display intermediate candidates."""
+    data = PanelData.model_validate(panel)
+    if not data.player.strip() and not data.team.strip():
+        raise ValueError("A player or team name is required for a panel.")
+    return data.model_dump()
 
 
 def run_tool(name: str, args: dict) -> str:

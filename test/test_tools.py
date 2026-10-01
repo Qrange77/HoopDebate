@@ -78,7 +78,7 @@ class ToolTests(unittest.TestCase):
                     "team_standings": {"team", "season_label", "standings", "note"},
                     "player_advanced_stats": {"player", "team", "headshot", "metrics", "provisional", "note"},
                     "team_advanced_stats": {"team", "metrics", "provisional", "note"}}
-        self.assertEqual(set(tools.TOOL_MAP), set(expected) | {"find_games"})
+        self.assertEqual(set(tools.TOOL_MAP), set(expected) | {"find_games", "game_players", "display_panel"})
         for schema in tools.TOOLS:
             f = schema["function"]
             self.assertEqual(set(f["parameters"]["properties"]), set(inspect.signature(tools.TOOL_MAP[f['name']]).parameters))

@@ -4,7 +4,7 @@ An English-language NBA assistant with focused ESPN tools, player photos, and
 transparent single-game advanced statistics. Built with FastAPI, LiteLLM, and Gemini.
 
 - The harness loop is the same one from `qwen-tool-calling`, wrapped in `run_agent()`.
-- The session store and `/chat` endpoint are the ones from `qwen-web-chat`.
+- `/chat` preserves the starter response format; sessions are stored locally as JSON files.
 - The model is: `vertex_ai/gemini-3.5-flash-lite` in the `global` location.
 - `/chat` also returns the tool calls the harness made, and the page shows them
   above the assistant's answer.
@@ -26,6 +26,8 @@ case sensitivity. Ambiguous names or games return a clarification message.
 
 | Tool | Result | Additional parameters |
 | --- | --- | --- |
+| `display_panel` | Prepare a final visual panel from supplied data, without lookup or calculation | Required structured `panel` |
+| `game_players` | Player IDs, names, teams, and did-not-play status in one game | Optional `team_name` |
 | `find_games` | Game IDs, matchups, and start times | Optional `team_name` |
 | `game_info` | Start time and participating teams | Optional `team_name` |
 | `game_status` | State, completion, period, and clock | Optional `team_name` |
@@ -96,7 +98,7 @@ healthy. A ranking is not inferred from the order of standings entries.
 
 From the repository root, run `.venv/bin/python -m unittest discover -s test -t . -v`
 for offline tests in `test/` covering all
-20 tools, output isolation, name and game ambiguity, quarter/overtime scoring,
+22 tools, output isolation, name and game ambiguity, quarter/overtime scoring,
 statistic selection, shot attribution, pagination, missing data, and errors.
 
 ## Advanced statistics and photos
@@ -130,15 +132,56 @@ Formula references: [Basketball Reference glossary](https://www.basketball-refer
 [NBA glossary](https://www.nba.com/stats/help/glossary).
 The simplified possession estimate is explicitly the application's chosen method.
 
-The frontend displays ESPN headshots returned by `player_info` and
-`player_advanced_stats`, with a fallback when a photo is missing or fails to load.
-Advanced results appear as metric cards with expandable formulas and inputs.
-Raw tool names, arguments, and results remain available in expandable call logs.
-Image URLs are restricted to HTTPS ESPN headshot URLs; model text is rendered
-as text, not arbitrary HTML.
+Data lookup tools return data only. The separate `display_panel(panel)` tool takes
+previously retrieved player/team data and selected metrics as structured parameters;
+it does not fetch data, compute statistics, or rank players. The model requests a
+panel only after research is complete when a visual is useful or explicitly requested.
+The frontend displays these panels after the final answer, never for intermediate
+`player_info` or advanced-stat queries. Saved conversations use the same rule.
+
+Panels support ESPN headshots with a missing-image fallback and expandable metric
+formulas/inputs. Raw tool calls remain in collapsed logs. Text is rendered safely as
+text, and image URLs are restricted to HTTPS ESPN headshots.
 
 Try these independent queries:
 
 - "Show Paolo Banchero's photo and advanced stats against Memphis on January 15, 2026."
 - "What was Orlando's estimated offensive rating against Memphis on January 15, 2026?"
 - "Calculate Paolo Banchero's TS% against Memphis on January 15, 2026, and show the inputs."
+
+## Saved conversations
+
+Click **New chat** to start with fresh context without deleting previous chats.
+Use the **Saved conversations** dropdown to reopen a conversation and continue it,
+including its previous answers, tool logs, photos, and metric cards. Empty new
+chats are saved only after the first message. Refreshing opens a blank chat; saved
+conversations remain available in the dropdown.
+
+History is stored on the machine running the server in
+`chat_history/<browser-id>/<session-id>.json` and is excluded from Git. Each file
+contains model context and displayable turns. A persistent HTTP-only browser cookie
+scopes the history list and access to that browser; different chats have separate
+context. This is anonymous browser isolation, not an account/login system. Clearing
+cookies loses access to that browser's saved history. Local server restarts retain
+history as long as the files and browser cookie remain.
+
+The file store uses atomic replacement and a single-process lock. It is intended
+for local, single-worker use. Multi-instance deployment needs shared persistent
+storage; container-local files should not be relied upon for durable cloud history.
+Session tests use temporary folders and a mocked model, without saving real chats.
+
+## Composing tools for comparisons
+
+The model combines basic tools instead of calling a ranking tool: `find_games`
+identifies the games, `game_players` lists each game's candidates, and repeated
+`player_advanced_stats` calls provide the selected metric for each player. The
+model compares the returned values, reports ties, and writes the answer. A daily
+comparison repeats this process across every game on the requested date.
+
+The harness allows 20 tool rounds (multiple calls per round), followed by one
+final tools-disabled summary request if the limit is reached. Partial coverage
+must be stated explicitly; an unchecked candidate prevents a definitive winner
+claim. No minimum shot-attempt threshold is imposed unless requested.
+
+Try: "Who had the highest eFG% across all games on March 31, 2026?"
+Large comparisons require more API calls and may reach the round limit.
