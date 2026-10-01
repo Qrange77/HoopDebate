@@ -1,72 +1,507 @@
-"""The tools the harness can run, and the JSON that describes them to the model."""
+"""Focused NBA tools backed by ESPN's game summary and scoreboard endpoints."""
 
+import inspect
 import json
+import unicodedata
+from datetime import datetime
+from functools import wraps
+from zoneinfo import ZoneInfo
 
 import requests
 
-# Open-Meteo is free and needs no API key.
-GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
-FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+from advanced_stats import PLAYER_METRICS, TEAM_METRICS, calculate, shooting_inputs
+
+NBA_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba"
+TOOLS = []
+TOOL_MAP = {}
+PARAMETERS = {
+    "metric": "Metric name or all (default). Player: efg_pct, ts_pct, game_score, ast_to_ratio, three_point_attempt_rate, free_throw_rate. Team additionally supports tov_pct, oreb_pct, estimated_possessions, offensive_rating, defensive_rating, net_rating, but not game_score or ast_to_ratio.",
+    "date": "Game date YYYY-MM-DD. Defaults to today in America/New_York when event_id is omitted.",
+    "event_id": "ESPN game ID returned by find_games. Can be used without date.",
+    "team_name": "Team name or abbreviation, e.g. Orlando Magic or ORL. Used to select a team or find its game.",
+    "player_name": "Player's name, preferably the full name. Ambiguous names require clarification.",
+    "quarter": "0 = full game (default); 1-4 = individual quarter; 5 = first overtime, 6 = second overtime, etc. Period scores are not cumulative.",
+    "stat": "Optional exact statistic name or label, e.g. points, PTS, rebounds, REB. Omit for all statistics.",
+    "category": "Single leader category supplied by ESPN, e.g. points, rebounds, assists.",
+    "period": "0 = all periods; 1-4 = quarters; 5 and above = overtime periods.",
+    "event_type": "Optional event type text filter, e.g. Jump Shot, Foul, or Substitution.",
+    "offset": "Number of matching events to skip for pagination.",
+    "limit": "Maximum number of events to return, from 1 to 100.",
+}
 
 
-def get_weather(location: str) -> str:
-    """Get the current weather for a location."""
+class LookupIssue(Exception):
+    def __init__(self, message, **details):
+        self.result = {"message": message, **details}
+
+
+def nba_tool(fn):
+    """Register a typed function and give every public tool a JSON/error boundary."""
+    signature = inspect.signature(fn)
+    properties, required = {}, []
+    for name, param in signature.parameters.items():
+        spec = {"type": "integer" if param.annotation is int else "string",
+                "description": PARAMETERS[name]}
+        if param.default is inspect.Parameter.empty:
+            required.append(name)
+        else:
+            spec["default"] = param.default
+        if param.annotation is int:
+            spec["minimum"] = 1 if name == "limit" else 0
+            if name == "limit":
+                spec["maximum"] = 100
+        properties[name] = spec
+
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        try:
+            bound = signature.bind(*args, **kwargs)
+            bound.apply_defaults()
+            for name, value in bound.arguments.items():
+                expected = signature.parameters[name].annotation
+                if type(value) is not expected:
+                    raise ValueError(f"{name} must be {expected.__name__}.")
+                if name in required and isinstance(value, str) and not value.strip():
+                    raise ValueError(f"{name} must not be empty.")
+                if expected is int and (value < 0 or (name == "limit" and not 1 <= value <= 100)):
+                    raise ValueError(f"Invalid {name}.")
+            result = fn(*args, **kwargs)
+        except LookupIssue as exc:
+            result = exc.result
+        except (requests.RequestException, ValueError, KeyError, IndexError, TypeError) as exc:
+            result = {"error": f"NBA lookup failed: {exc}"}
+        return json.dumps(result)
+
+    TOOL_MAP[fn.__name__] = wrapped
+    TOOLS.append({"type": "function", "function": {
+        "name": fn.__name__, "description": inspect.getdoc(fn),
+        "parameters": {"type": "object", "properties": properties,
+                       "required": required, "additionalProperties": False},
+    }})
+    return wrapped
+
+
+def _fetch(path, **params):
+    response = requests.get(f"{NBA_URL}/{path}", params=params, timeout=15)
+    response.raise_for_status()
+    return response.json()
+
+
+def _normalize(value):
+    return "".join(c for c in unicodedata.normalize("NFKD", str(value)).casefold()
+                   if c.isalnum())
+
+
+def _matches(query, entity):
+    values = [entity.get(k, "") for k in
+              ("displayName", "fullName", "shortName", "shortDisplayName", "name", "abbreviation")]
+    q = _normalize(query)
+    return any(q and q == _normalize(v) for v in values)
+
+
+def _choose(items, query, entity_key):
+    exact = [item for item in items if _matches(query, item.get(entity_key, {}))]
+    matches = exact or [item for item in items if _normalize(query) in
+                       _normalize(item.get(entity_key, {}).get("displayName", ""))]
+    if len(matches) != 1:
+        raise LookupIssue("No matching name found." if not matches else
+                          "Name is ambiguous. Please choose a full name.",
+                          candidates=[i.get(entity_key, {}).get("displayName") for i in matches])
+    return matches[0]
+
+
+def _day(date):
+    return (datetime.strptime(date, "%Y-%m-%d") if date else
+            datetime.now(ZoneInfo("America/New_York"))).strftime("%Y-%m-%d")
+
+
+def _events(date, team_name):
+    day = _day(date)
+    events = _fetch("scoreboard", dates=day.replace("-", ""), limit=100).get("events", [])
+    if team_name:
+        teams = {}
+        for event in events:
+            for c in event.get("competitions", [{}])[0].get("competitors", []):
+                teams[c["team"]["id"]] = c
+        if not teams:
+            return day, []
+        selected = _choose(list(teams.values()), team_name, "team")["team"]["id"]
+        events = [e for e in events if any(c["team"]["id"] == selected for c in
+                                         e["competitions"][0].get("competitors", []))]
+    return day, events
+
+
+def _game(date, event_id, team_name=""):
+    if not event_id:
+        day, events = _events(date, team_name)
+        if len(events) != 1:
+            raise LookupIssue("No matching game found." if not events else
+                              "Multiple games found. Choose an event_id.", date=day,
+                              games=[{"event_id": e["id"], "matchup": e["name"],
+                                      "start_time": e.get("date")} for e in events])
+        event_id = events[0]["id"]
+    data = _fetch("summary", event=event_id)
+    competitions = data.get("header", {}).get("competitions", [])
+    if not competitions:
+        raise LookupIssue("Game data is unavailable.")
+    competition = competitions[0]
+    if date:
+        expected = _day(date)
+        actual = datetime.fromisoformat(competition["date"].replace("Z", "+00:00"))
+        if actual.astimezone(ZoneInfo("America/New_York")).strftime("%Y-%m-%d") != expected:
+            raise LookupIssue("The event_id does not match the requested date.")
+    if team_name:
+        _choose(competition.get("competitors", []), team_name, "team")
+    return data, competition
+
+
+def _team(data, competition, team_name, section=None):
+    chosen = _choose(competition.get("competitors", []), team_name, "team")
+    if section is None:
+        return chosen
+    for item in data.get("boxscore", {}).get(section, []):
+        if item.get("team", {}).get("id") == chosen["team"]["id"]:
+            return item
+    raise LookupIssue("Team statistics are unavailable.")
+
+
+def _player(data, player_name, team_name=""):
+    squads = data.get("boxscore", {}).get("players", [])
+    if team_name:
+        squads = [_choose(squads, team_name, "team")]
+    rows = []
+    for squad in squads:
+        for group in squad.get("statistics", []):
+            for row in group.get("athletes", []):
+                rows.append({**row, "team_name": squad["team"]["displayName"],
+                             "stat_labels": group.get("labels", []),
+                             "stat_keys": group.get("keys", [])})
+    return _choose(rows, player_name, "athlete")
+
+
+def _stats(stats, requested):
+    if not stats:
+        raise LookupIssue("Statistics are unavailable.")
+    if not requested:
+        return {s["name"]: s["value"] for s in stats}
+    matches = [s for s in stats if _normalize(requested) in
+               {_normalize(s.get(k, "")) for k in ("name", "label", "abbreviation")}]
+    if len(matches) != 1:
+        raise LookupIssue("Statistic is unavailable or ambiguous.",
+                          available_stats=[s["name"] for s in stats])
+    return {matches[0]["name"]: matches[0]["value"]}
+
+
+def _available(data, key):
+    value = data.get(key)
+    if not value:
+        raise LookupIssue(f"{key.replace('_', ' ').capitalize()} data is unavailable.")
+    return value
+
+
+@nba_tool
+def find_games(date: str = "", team_name: str = ""):
+    """Find game IDs, matchups, and start times only; optionally filter by team."""
+    day, events = _events(date, team_name)
+    return {"date": day, "games": [{"event_id": e["id"], "matchup": e["name"],
+                                     "start_time": e.get("date")} for e in events]}
+
+
+@nba_tool
+def game_info(date: str = "", event_id: str = "", team_name: str = ""):
+    """Return only the game start time and participating teams, without scores or status."""
+    _, c = _game(date, event_id, team_name)
+    return {"start_time": c.get("date"),
+            "teams": [i["team"]["displayName"] for i in c.get("competitors", [])]}
+
+
+@nba_tool
+def game_status(date: str = "", event_id: str = "", team_name: str = ""):
+    """Return only game state, completion, period, and remaining clock."""
+    d, c = _game(date, event_id, team_name)
+    s = _available(c, "status")
+    if "period" not in s or "displayClock" not in s:
+        game_day = datetime.fromisoformat(c["date"].replace("Z", "+00:00")).astimezone(
+            ZoneInfo("America/New_York")).strftime("%Y%m%d")
+        events = _fetch("scoreboard", dates=game_day, limit=100).get("events", [])
+        matching = next((e for e in events if str(e.get("id")) ==
+                         str(c.get("id", d.get("header", {}).get("id")))), {})
+        s = {**matching.get("status", {}), **s}
+    return {"status": s.get("type", {}).get("description"),
+            "state": s.get("type", {}).get("state"),
+            "completed": s.get("type", {}).get("completed"),
+            "period": s.get("period"), "clock": s.get("displayClock")}
+
+
+@nba_tool
+def game_score(date: str = "", event_id: str = "", team_name: str = "", quarter: int = 0):
+    """Return only team names and scores: full game by default, or one quarter/overtime."""
+    _, c = _game(date, event_id, team_name)
+    if c.get("status", {}).get("type", {}).get("state") == "pre":
+        raise LookupIssue("Game has not started; scores are unavailable.")
+    current_period = c.get("status", {}).get("period")
+    if quarter and current_period is not None and quarter > current_period:
+        raise LookupIssue("The requested period has not started.")
+    scores = []
+    for competitor in c.get("competitors", []):
+        score = competitor.get("score")
+        if quarter:
+            periods = competitor.get("linescores", [])
+            entry = next((v for n, v in enumerate(periods, 1)
+                          if v.get("period", n) == quarter), {})
+            score = entry.get("displayValue", entry.get("value"))
+        if score is None:
+            raise LookupIssue("The requested score is unavailable; the period may not have started.")
+        scores.append({"team": competitor["team"]["displayName"], "score": score})
+    return {"scores": scores}
+
+
+@nba_tool
+def team_game_info(team_name: str, date: str = "", event_id: str = ""):
+    """Return only the selected team's home/away designation and final winner flag."""
+    d, c = _game(date, event_id, team_name)
+    t = _team(d, c, team_name)
+    return {"team": t["team"]["displayName"], "home_away": t.get("homeAway"),
+            "winner": t.get("winner") if c.get("status", {}).get("type", {}).get("completed") else None}
+
+
+@nba_tool
+def team_game_stats(team_name: str, date: str = "", event_id: str = "", stat: str = ""):
+    """Return only the selected team's single-game statistics, optionally one stat."""
+    d, c = _game(date, event_id, team_name)
+    t = _team(d, c, team_name, "teams")
+    stats = [{**s, "value": s.get("displayValue")} for s in t.get("statistics", [])]
+    return {"team": t["team"]["displayName"], "stats": _stats(stats, stat)}
+
+
+@nba_tool
+def team_game_leader(team_name: str, category: str, date: str = "", event_id: str = ""):
+    """Return only ESPN's leaders for the selected team and one category; not an overall player award."""
+    d, c = _game(date, event_id, team_name)
+    t = _team(d, c, team_name)["team"]
+    categories = next((x.get("leaders", []) for x in d.get("leaders", [])
+                       if x.get("team", {}).get("id") == t["id"]), [])
+    matches = [x for x in categories if _normalize(category) in
+               {_normalize(x.get("name", "")), _normalize(x.get("displayName", ""))}]
+    if len(matches) != 1 or not matches[0].get("leaders"):
+        raise LookupIssue("Leader category is unavailable.",
+                          available_categories=[x.get("name") for x in categories])
+    return {"team": t["displayName"], "category": matches[0]["name"],
+            "leaders": [{"player": x["athlete"]["displayName"], "value": x.get("displayValue")}
+                        for x in matches[0]["leaders"]]}
+
+
+@nba_tool
+def player_info(player_name: str, date: str = "", event_id: str = "", team_name: str = ""):
+    """Return only a player's identity, position, jersey number, and headshot from this game's roster."""
+    d, _ = _game(date, event_id, team_name)
+    p = _player(d, player_name, team_name)["athlete"]
+    return {"player": p.get("displayName"), "id": p.get("id"),
+            "position": p.get("position", {}).get("displayName"),
+            "jersey": p.get("jersey"), "headshot": p.get("headshot", {}).get("href")}
+
+
+@nba_tool
+def player_game_status(player_name: str, date: str = "", event_id: str = "", team_name: str = ""):
+    """Return only a player's starter, did-not-play, and ejection flags and applicable absence reason."""
+    d, _ = _game(date, event_id, team_name)
+    p = _player(d, player_name, team_name)
+    return {"player": p["athlete"]["displayName"], "starter": p.get("starter"),
+            "did_not_play": p.get("didNotPlay"), "ejected": p.get("ejected"),
+            "reason": p.get("reason") if p.get("didNotPlay") else None}
+
+
+@nba_tool
+def player_game_stats(player_name: str, date: str = "", event_id: str = "", team_name: str = "", stat: str = ""):
+    """Return only a named player's single-game statistics, optionally one stat."""
+    d, _ = _game(date, event_id, team_name)
+    p = _player(d, player_name, team_name)
+    if p.get("didNotPlay"):
+        raise LookupIssue("Player did not play; statistics are unavailable.")
+    stats = [{"name": p["stat_keys"][i] if i < len(p["stat_keys"]) else label,
+              "label": label, "value": value}
+             for i, (label, value) in enumerate(zip(p["stat_labels"], p.get("stats", [])))]
+    return {"player": p["athlete"]["displayName"], "stats": _stats(stats, stat)}
+
+
+def _play(p):
+    return {"id": p.get("id"), "period": p.get("period", {}).get("number"),
+            "clock": p.get("clock", {}).get("displayValue"), "text": p.get("text"),
+            "type": p.get("type", {}).get("text"),
+            "home_score": p.get("homeScore"), "away_score": p.get("awayScore")}
+
+
+def _page(items, offset, limit, key):
+    end = offset + limit
+    return {key: items[offset:end], "total": len(items),
+            "next_offset": end if end < len(items) else None}
+
+
+@nba_tool
+def game_plays(date: str = "", event_id: str = "", team_name: str = "", period: int = 0,
+               event_type: str = "", offset: int = 0, limit: int = 50):
+    """Return only paginated play-by-play events, optionally filtered by period and event type."""
+    d, _ = _game(date, event_id, team_name)
+    plays = [p for p in _available(d, "plays")
+             if (not period or p.get("period", {}).get("number") == period)
+             and (not event_type or event_type.casefold() in p.get("type", {}).get("text", "").casefold())]
+    return _page([_play(p) for p in plays], offset, limit, "plays")
+
+
+@nba_tool
+def player_shots(player_name: str, date: str = "", event_id: str = "", team_name: str = "",
+                 period: int = 0, offset: int = 0, limit: int = 50):
+    """Return only a named player's shot attempts, outcomes, and available coordinates, paginated."""
+    d, _ = _game(date, event_id, team_name)
+    player = _player(d, player_name, team_name)["athlete"]
+    shots = []
+    for p in _available(d, "plays"):
+        participants = p.get("participants", [])
+        # ESPN lists the shooter first; subsequent participants may be an assister or blocker.
+        if not p.get("shootingPlay") or not participants:
+            continue
+        if str(participants[0].get("athlete", {}).get("id")) != str(player["id"]):
+            continue
+        if period and p.get("period", {}).get("number") != period:
+            continue
+        shots.append({"period": p.get("period", {}).get("number"),
+                      "clock": p.get("clock", {}).get("displayValue"), "text": p.get("text"),
+                      "made": p.get("scoringPlay"), "points_attempted": p.get("pointsAttempted"),
+                      "coordinate": p.get("coordinate")})
+    return {"player": player["displayName"], **_page(shots, offset, limit, "shots")}
+
+
+@nba_tool
+def game_venue(date: str = "", event_id: str = "", team_name: str = ""):
+    """Return only the venue name and location."""
+    d, _ = _game(date, event_id, team_name)
+    v = _available(d.get("gameInfo", {}), "venue")
+    return {"venue": v.get("fullName"), "address": v.get("address")}
+
+
+@nba_tool
+def game_officials(date: str = "", event_id: str = "", team_name: str = ""):
+    """Return only the game's officials and their roles."""
+    d, _ = _game(date, event_id, team_name)
+    return {"officials": [{"name": x.get("displayName", x.get("fullName")),
+                           "role": x.get("position", {}).get("displayName")}
+                          for x in _available(d.get("gameInfo", {}), "officials")]}
+
+
+@nba_tool
+def team_injuries(team_name: str, date: str = "", event_id: str = ""):
+    """Return only the selected team's supplied injury reports. These may be current, not historical game-day reports."""
+    d, c = _game(date, event_id, team_name)
+    t = _team(d, c, team_name)["team"]
+    rows = next((x.get("injuries") for x in d.get("injuries", [])
+                 if x.get("team", {}).get("id") == t["id"]), None)
+    if rows is None:
+        raise LookupIssue("Injury reports are unavailable for this team.")
+    return {"team": t["displayName"], "injuries": [
+        {"player": x.get("athlete", {}).get("displayName"), "status": x.get("status"),
+         "reported_at": x.get("date"), "details": x.get("details"),
+         "description": x.get("shortComment")} for x in rows],
+        "note": "ESPN-supplied reports may be current, not from the game date. An empty list does not confirm no injuries."}
+
+
+@nba_tool
+def game_recap(date: str = "", event_id: str = "", team_name: str = ""):
+    """Return only the game recap headline, supplied summary, publication time, and link."""
+    d, _ = _game(date, event_id, team_name)
+    a = _available(d, "article")
+    return {"headline": a.get("headline"), "summary": a.get("description"),
+            "published": a.get("published"), "url": a.get("links", {}).get("web", {}).get("href")}
+
+
+@nba_tool
+def game_videos(date: str = "", event_id: str = "", team_name: str = ""):
+    """Return only available game video titles, descriptions, and links."""
+    d, _ = _game(date, event_id, team_name)
+    return {"videos": [{"title": v.get("headline"), "description": v.get("description"),
+                        "links": v.get("links", {})} for v in _available(d, "videos")]}
+
+
+@nba_tool
+def team_standings(team_name: str, date: str = "", event_id: str = ""):
+    """Return only the selected team's supplied standings; season may differ from the game date. Do not infer rank from list order."""
+    d, c = _game(date, event_id, team_name)
+    t = _team(d, c, team_name)["team"]
+    standings = _available(d, "standings")
+    entries = []
+    for group in standings.get("groups", []):
+        for entry in group.get("standings", {}).get("entries", []):
+            identity = entry.get("team", {})
+            identity = identity if isinstance(identity, dict) else {}
+            if str(entry.get("id", identity.get("id"))) == str(t["id"]):
+                entries.append({"group": group.get("header", group.get("name")),
+                                "stats": {s["name"]: s.get("displayValue", s.get("value"))
+                                          for s in entry.get("stats", [])}})
+    if not entries:
+        raise LookupIssue("Standings are unavailable for this team.")
+    return {"team": t["displayName"], "season_label": standings.get("header"),
+            "standings": entries,
+            "note": "ESPN-supplied standings may be current, not from the game date. Rank is unavailable unless explicitly supplied."}
+
+
+def _advanced_state(competition):
+    state = competition.get("status", {}).get("type", {})
+    if state.get("state") == "pre":
+        raise LookupIssue("Game has not started; advanced statistics are unavailable.")
+    return not state.get("completed", False)
+
+
+@nba_tool
+def player_advanced_stats(player_name: str, date: str = "", event_id: str = "", team_name: str = "", metric: str = "all"):
+    """Calculate a player's single-game eFG%, TS%, Game Score, AST/TO, 3PAr, and FTr. Return formulas, inputs, and availability; TS% is estimated. No award selection."""
+    d, c = _game(date, event_id, team_name)
+    provisional = _advanced_state(c)
+    p = _player(d, player_name, team_name)
+    if p.get("didNotPlay"):
+        raise LookupIssue("Player did not play; advanced statistics are unavailable.")
+    raw = dict(zip(p["stat_labels"], p.get("stats", [])))
+    return {"player": p["athlete"]["displayName"], "team": p["team_name"],
+            "headshot": p["athlete"].get("headshot", {}).get("href"),
+            "metrics": calculate(shooting_inputs(raw), PLAYER_METRICS, metric),
+            "provisional": provisional,
+            "note": "Calculated locally from ESPN box scores. TS% uses an estimated 0.44 free-throw factor. Game Score summarizes box-score production, not overall impact or an official award."}
+
+
+def _team_advanced_inputs(d, c, name):
+    squad = _team(d, c, name, "teams")
+    competitor = _team(d, c, name)
+    stats = {s["name"]: s.get("displayValue") for s in squad.get("statistics", [])}
+    fields = {"FG": "fieldGoalsMade-fieldGoalsAttempted", "3PT": "threePointFieldGoalsMade-threePointFieldGoalsAttempted",
+              "FT": "freeThrowsMade-freeThrowsAttempted", "OREB": "offensiveRebounds", "DREB": "defensiveRebounds",
+              "TO": "totalTurnovers" if "totalTurnovers" in stats else "turnovers"}
+    raw = {key: stats.get(source) for key, source in fields.items()}
+    raw["PTS"] = competitor.get("score")
+    return shooting_inputs(raw)
+
+
+@nba_tool
+def team_advanced_stats(team_name: str, date: str = "", event_id: str = "", metric: str = "all"):
+    """Calculate one team's single-game shooting rates, turnover/rebound percentages, estimated possessions and offensive/defensive/net ratings. Uses both teams' box scores; estimates may differ from official play-by-play ratings."""
+    d, c = _game(date, event_id, team_name)
+    provisional = _advanced_state(c)
+    team = _team(d, c, team_name)["team"]
+    opponents = [x["team"] for x in c.get("competitors", []) if x["team"]["id"] != team["id"]]
+    if len(opponents) != 1:
+        raise LookupIssue("A unique opponent is required for team advanced statistics.")
+    inputs = _team_advanced_inputs(d, c, team["displayName"])
     try:
-        places = requests.get(GEOCODE_URL, params={"name": location, "count": 1}, timeout=10).json()
-        if not places.get("results"):
-            return json.dumps({"error": f"City '{location}' was not found."})
-        place = places["results"][0]
-
-        current = requests.get(
-            FORECAST_URL,
-            params={
-                "latitude": place["latitude"],
-                "longitude": place["longitude"],
-                "current": "temperature_2m,relative_humidity_2m,wind_speed_10m",
-                "temperature_unit": "fahrenheit",
-                "wind_speed_unit": "mph",
-            },
-            timeout=10,
-        ).json()["current"]
-    except requests.RequestException as e:
-        # The model cannot see an exception. Return something it can reason about.
-        return json.dumps({"error": f"Weather service failed: {e}"})
-
-    return json.dumps({
-        "location": place["name"],
-        "temp_f": current["temperature_2m"],
-        "humidity": current["relative_humidity_2m"],
-        "wind_mph": current["wind_speed_10m"],
-    })
-
-
-# What the model sees: the "set notes" in the screenplay.
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_weather",
-            "description": "Get the current weather (temperature, humidity, wind) for a city.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "location": {"type": "string", "description": "City name, e.g. 'New York'"},
-                },
-                "required": ["location"],
-            },
-        },
-    },
-]
-
-# What the harness runs: tool name -> Python function.
-TOOL_MAP = {"get_weather": get_weather}
+        opponent = _team_advanced_inputs(d, c, opponents[0]["displayName"])
+    except LookupIssue:
+        opponent = {}
+    inputs.update({"OPP_" + k: v for k, v in opponent.items()})
+    return {"team": team["displayName"], "metrics": calculate(inputs, TEAM_METRICS, metric),
+            "provisional": provisional,
+            "note": "Calculated locally. Possessions use the average of both teams' (FGA + 0.44*FTA - OREB + TO), including overtime. TS%, TOV%, possessions and ratings are estimates, not official NBA possession counts or ratings. Rebound percentage uses box-score rebound totals."}
 
 
 def run_tool(name: str, args: dict) -> str:
-    """Run one tool call. Models invent tool names and arguments; never let that crash the loop."""
+    """Dispatch only registered tools and report malformed calls without crashing."""
     if name not in TOOL_MAP:
         return json.dumps({"error": f"Unknown tool '{name}'. Available: {list(TOOL_MAP)}"})
-    try:
-        return TOOL_MAP[name](**args)
-    except TypeError as e:
-        return json.dumps({"error": f"Bad arguments for {name}: {e}"})
+    if not isinstance(args, dict):
+        return json.dumps({"error": "Tool arguments must be an object."})
+    return TOOL_MAP[name](**args)

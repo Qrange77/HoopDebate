@@ -3,7 +3,7 @@
     <head>
         <meta charset="UTF-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-        <title>Gemini Web Tool Calling</title>
+        <title>NBA Game Lab</title>
         <style>
             * {
                 box-sizing: border-box;
@@ -95,6 +95,32 @@
                 letter-spacing: 0.05em;
                 color: #b45309;
             }
+            .intro { padding: 1.5rem 2rem; border-bottom: 1px solid #e0e0e0; }
+            .intro h1 { font-size: 1.4rem; margin-bottom: .5rem; }
+            .intro p { color: #555; line-height: 1.5; }
+            .content { white-space: pre-wrap; overflow-wrap: anywhere; }
+            .result-card { border: 1px solid #ddd; border-radius: 12px; padding: 1rem; width: 100%; }
+            .player-header { display: flex; align-items: center; gap: 1rem; margin-bottom: .75rem; }
+            .headshot { width: 104px; height: 80px; object-fit: contain; background: #f3f4f6; border-radius: 8px; }
+            .photo-placeholder { width: 104px; min-height: 80px; display: grid; place-items: center; background: #f3f4f6; color: #666; font-size: .75rem; border-radius: 8px; text-align: center; }
+            .photo-placeholder[hidden] { display: none; }
+            .result-card p { color: #555; font-size: .85rem; line-height: 1.5; }
+            .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: .75rem; }
+            .metric { background: #f8f9fa; border-radius: 8px; padding: .75rem; min-width: 0; }
+            .metric h3 { font-size: .8rem; font-weight: 500; color: #444; }
+            .metric .value { font-size: 1.5rem; font-weight: 650; margin: .3rem 0; }
+            .metric details { margin-top: .5rem; font-size: .75rem; overflow-wrap: anywhere; }
+            .metric pre { white-space: pre-wrap; }
+            .badge { font-size: .7rem; color: #8a4a00; }
+            .result-note { margin-top: .75rem; }
+            .tool summary { cursor: pointer; font-weight: 600; }
+            @media (max-width: 600px) {
+                body { padding: .5rem; height: auto; }
+                #messages { padding: 1rem; }
+                .msg { max-width: 95%; }
+                #input-area { padding: 1rem; }
+                #user-input { min-width: 0; }
+            }
             button:disabled {
                 opacity: 0.3;
             }
@@ -102,12 +128,18 @@
     </head>
     <body>
         <div id="container">
-            <div id="messages"></div>
+            <header class="intro">
+                <h1>NBA Game Lab</h1>
+                <p>Explore games, player profiles, and single-game efficiency.</p>
+                <p>Try: "Show Paolo Banchero's photo and advanced stats against Memphis on January 15, 2026."</p>
+            </header>
+            <div id="messages" aria-live="polite"></div>
             <div id="input-area">
                 <input
                     type="text"
                     id="user-input"
-                    placeholder="Type a message..."
+                    placeholder="Ask about an NBA game or player..."
+                    aria-label="Your message"
                     autocomplete="off"
                 />
                 <button id="send-btn">Send</button>
@@ -125,20 +157,91 @@
                     "msg " +
                     (role === "you" ? "user" : "assistant") +
                     (isLoading ? " loading" : "");
-                div.innerHTML =
-                    '<div class="role">' +
-                    role +
-                    '</div><div class="content">' +
-                    text +
-                    "</div>";
+                const roleLabel = document.createElement("div");
+                roleLabel.className = "role";
+                roleLabel.textContent = role;
+                const content = document.createElement("div");
+                content.className = "content";
+                content.textContent = text;
+                div.append(roleLabel, content);
                 messages.appendChild(div);
                 messages.scrollTop = messages.scrollHeight;
                 return div;
             }
 
+            function element(tag, className, text) {
+                const node = document.createElement(tag);
+                node.className = className;
+                if (text !== undefined) node.textContent = text;
+                return node;
+            }
+
+            function headshotUrl(value) {
+                try {
+                    const url = new URL(value);
+                    if (url.protocol === "https:" && url.hostname === "a.espncdn.com" &&
+                        url.pathname.startsWith("/i/headshots/")) return url.href;
+                } catch (_) { /* Missing or invalid image URL. */ }
+                return null;
+            }
+
+            function renderResult(call, before) {
+                if (!["player_info", "player_advanced_stats", "team_advanced_stats"].includes(call.name)) return;
+                let result;
+                try { result = typeof call.result === "string" ? JSON.parse(call.result) : call.result; }
+                catch (_) { return; }
+                if (!result || result.error || result.message || (!result.player && !result.team)) return;
+                const card = element("section", "result-card");
+                const header = element("div", "player-header");
+                if (result.player) {
+                    const placeholder = element("div", "photo-placeholder", "Photo unavailable");
+                    const url = headshotUrl(result.headshot);
+                    header.append(placeholder);
+                    if (url) {
+                        const img = element("img", "headshot");
+                        img.alt = result.player + " headshot";
+                        img.referrerPolicy = "no-referrer";
+                        img.addEventListener("load", () => { placeholder.hidden = true; });
+                        img.addEventListener("error", () => { img.remove(); placeholder.hidden = false; });
+                        img.src = url;
+                        header.prepend(img);
+                        placeholder.hidden = true;
+                    }
+                }
+                const heading = element("div", "");
+                heading.append(element("h2", "", result.player || result.team));
+                const identity = [result.player ? result.team : null, result.position,
+                    result.jersey ? "#" + result.jersey : null].filter(Boolean).join(" · ");
+                if (identity) heading.append(element("p", "", identity));
+                if (result.provisional) heading.append(element("p", "badge", "Live game · Provisional statistics"));
+                header.append(heading);
+                card.append(header);
+                if (result.metrics) {
+                    const grid = element("div", "metrics");
+                    for (const metric of Object.values(result.metrics)) {
+                        const tile = element("div", "metric");
+                        tile.append(element("h3", "", metric.label));
+                        const value = typeof metric.value === "number" && Number.isFinite(metric.value)
+                            ? metric.value.toFixed(2) + (metric.unit === "%" ? "%" : "") : "N/A";
+                        tile.append(element("div", "value", value));
+                        if (metric.unit !== "%") tile.append(element("p", "", metric.unit));
+                        if (metric.estimated) tile.append(element("span", "badge", "Estimated"));
+                        if (metric.unavailable_reason) tile.append(element("p", "", metric.unavailable_reason));
+                        const details = element("details", "");
+                        details.append(element("summary", "", "Formula & inputs"),
+                            element("p", "", metric.formula), element("pre", "", JSON.stringify(metric.inputs, null, 2)));
+                        tile.append(details);
+                        grid.append(tile);
+                    }
+                    card.append(grid);
+                }
+                if (result.note) card.append(element("p", "result-note", result.note));
+                messages.insertBefore(card, before);
+            }
+
             async function send() {
                 const text = userInput.value.trim();
-                if (!text) return;
+                if (!text || sendBtn.disabled) return;
 
                 userInput.value = "";
                 sendBtn.disabled = true;
@@ -159,18 +262,11 @@
 
                     // Show each tool the harness ran, above the assistant's answer
                     for (const call of data.tool_calls || []) {
-                        const div = document.createElement("div");
-                        div.className = "tool";
-                        const label = document.createElement("span");
-                        label.className = "label";
-                        label.textContent = "tool call  ";
-                        div.appendChild(label);
-                        div.appendChild(
-                            document.createTextNode(
-                                call.name + "(" + JSON.stringify(call.args) + ")\n→ " + call.result,
-                            ),
-                        );
+                        const div = element("details", "tool");
+                        div.append(element("summary", "", "Tool call: " + call.name));
+                        div.append(element("div", "", JSON.stringify(call.args, null, 2) + "\n" + call.result));
                         messages.insertBefore(div, loading);
+                        renderResult(call, loading);
                     }
                     loading.querySelector(".content").textContent =
                         data.response;
@@ -180,6 +276,7 @@
                         "Error: " + e.message;
                     loading.classList.remove("loading");
                 }
+                messages.scrollTop = messages.scrollHeight;
                 sendBtn.disabled = false;
                 userInput.focus();
             }
