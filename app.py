@@ -2,17 +2,24 @@ import json
 import uuid
 import copy
 from datetime import datetime, timezone
-from threading import RLock
+from threading import RLock, Thread, Event
+from queue import Queue, Empty
 from pathlib import Path
 
 import litellm
 import uvicorn
 from fastapi import FastAPI, Cookie, Depends, HTTPException, Response
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from typing import Literal
 
-from tools import TOOLS, run_tool
+from backend.assistant.tools import TOOLS, run_tool
+from backend.debate.tools import DebateConfig
+from backend.debate.agent import run_debate
+from backend.data.nba import NBAData
+from backend.activity import ActivityLog
+from backend.paths import PROJECT_ROOT
 
 # --- Config ---
 
@@ -54,14 +61,15 @@ MAX_TOOL_ROUNDS = 20
 # --- The Harness ---
 
 
-def run_agent(messages: list[dict]) -> tuple[str, list[dict]]:
+def run_agent(messages: list[dict], on_event=None) -> tuple[str, list[dict]]:
     """Complete until the model answers without asking for a tool.
 
     Returns the final text and a record of every tool call made along the way.
     """
-    tool_calls = []
+    tool_calls = ActivityLog(on_event)
 
     for _ in range(MAX_TOOL_ROUNDS):
+        tool_calls.phase('Preparing a reply')
         reply = litellm.completion(
             model="vertex_ai/gemini-3.5-flash-lite",
             vertex_location="global",
@@ -80,8 +88,9 @@ def run_agent(messages: list[dict]) -> tuple[str, list[dict]]:
         # The harness, not the model, runs each tool and appends the result
         for call in reply.tool_calls:
             args = json.loads(call.function.arguments)
+            tool_calls.start(call.function.name,args)
             result = run_tool(call.function.name, args)
-            tool_calls += [{"name": call.function.name, "args": args, "result": result}]
+            tool_calls.append({"name": call.function.name, "args": args, "result": result})
 
             messages += [{"role": "tool", "tool_call_id": call.id, "content": result}]
 
@@ -103,7 +112,7 @@ def run_agent(messages: list[dict]) -> tuple[str, list[dict]]:
 
 # --- Session Store ---
 
-HISTORY_DIR = Path(__file__).parent / "chat_history"
+HISTORY_DIR = PROJECT_ROOT / "chat_history"
 store_lock = RLock()
 
 
@@ -145,19 +154,24 @@ def save_history(owner, record):
 # --- FastAPI App ---
 
 app = FastAPI()
-FRONTEND_DIST = Path(__file__).parent / "frontend" / "dist"
+FRONTEND_DIST = PROJECT_ROOT / "frontend" / "dist"
 app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets", check_dir=False), name="frontend-assets")
 
 
 class ChatRequest(BaseModel):
     message: str
     session_id: str | None = None
+    mode: Literal['assistant', 'debate', 'rebuttal'] | None = None
+    debate_config: DebateConfig | None = None
+    reply_tone: Literal['reasoned', 'roast'] | None = None
 
 
 class ChatResponse(BaseModel):
     response: str
     session_id: str
     tool_calls: list[dict]
+    debate_result: dict | None = None
+    failed: bool = False
 
 
 @app.get("/")
@@ -169,7 +183,7 @@ def index():
 
 @app.get("/favicon.svg")
 def favicon():
-    return FileResponse(Path(__file__).parent / "frontend" / "public" / "favicon.svg")
+    return FileResponse(PROJECT_ROOT / "frontend" / "public" / "favicon.svg")
 
 
 @app.get("/sessions")
@@ -179,7 +193,8 @@ def list_sessions(owner: str = Depends(browser_owner)):
         for path in (HISTORY_DIR / owner).glob("*.json"):
             try:
                 record = json.loads(path.read_text())
-                records.append({key: record[key] for key in ("session_id", "title", "updated_at")})
+                records.append({**{key: record[key] for key in ("session_id", "title", "updated_at")},
+                                'mode': record.get('mode', 'assistant')})
             except (ValueError, OSError, KeyError):
                 continue
         return sorted(records, key=lambda item: item["updated_at"], reverse=True)
@@ -189,33 +204,130 @@ def list_sessions(owner: str = Depends(browser_owner)):
 def get_session(session_id: str, owner: str = Depends(browser_owner)):
     with store_lock:
         record = read_history(owner, session_id)
-        return {key: record[key] for key in ("session_id", "title", "turns")}
+        return {**{key: record[key] for key in ("session_id", "title", "turns")},
+                'mode': record.get('mode', 'assistant'), 'debate_config': record.get('debate_config'),
+                'player_names': record.get('player_names', {}), 'reply_tone':record.get('reply_tone', 'reasoned')}
+
+
+@app.get('/players')
+def search_players(query: str = ''):
+    if not 2 <= len(query.strip()) <= 100:
+        return {'players': [], 'complete': True, 'resolved': False}
+    return NBAData(budget=12).resolve(query.strip())
 
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest, owner: str = Depends(browser_owner)):
+    return _chat(request,owner)
+
+
+@app.post('/chat/stream')
+def chat_stream(request: ChatRequest, response: Response, owner: str = Depends(browser_owner)):
+    queue = Queue()
+    disconnected = Event()
+    def emit(event):
+        if not disconnected.is_set():
+            queue.put(event)
+    def work():
+        try:
+            result = _chat(request,owner,emit)
+            emit({'type':'done','data':result.model_dump()})
+        except HTTPException as exc:
+            emit({'type':'error','message':str(exc.detail),'status':exc.status_code})
+        except Exception:
+            emit({'type':'error','message':'Unable to complete or save this conversation.'})
+    def events():
+        Thread(target=work,daemon=True).start()
+        try:
+            yield 'data: '+json.dumps({'type':'phase','label':'Preparing your request'})+'\n\n'
+            while True:
+                try:
+                    event=queue.get(timeout=10)
+                except Empty:
+                    yield ': keepalive\n\n'
+                    continue
+                yield 'data: '+json.dumps(event,ensure_ascii=False)+'\n\n'
+                if event['type'] in ('done','error'):
+                    break
+        finally:
+            # A started turn may finish saving after disconnect; do not buffer events.
+            disconnected.set()
+    stream = StreamingResponse(events(),media_type='text/event-stream',headers={'Cache-Control':'no-cache','X-Accel-Buffering':'no'})
+    for key,value in response.raw_headers:
+        if key.lower()==b'set-cookie':
+            stream.raw_headers.append((key,value))
+    return stream
+
+
+def _chat(request: ChatRequest, owner: str, on_event=None):
+    activity = []
+    def emit(event):
+        if event['type']=='tool_start':
+            activity.append(dict(event['call']))
+        elif event['type']=='tool_end':
+            for index,call in enumerate(activity):
+                if call['id']==event['call']['id']:
+                    activity[index]=dict(event['call'])
+                    break
+        if on_event:
+            on_event(event)
     if not request.message.strip():
         raise HTTPException(400, "Message must not be empty")
     with store_lock:
         if request.session_id:
             record = read_history(owner, request.session_id)
+            if request.mode is not None and request.mode != record.get('mode', 'assistant'):
+                raise HTTPException(409, 'Start a new conversation to change modes.')
+            if request.debate_config is not None and (not record.get('debate_config') or request.debate_config.model_dump() != DebateConfig.model_validate(record['debate_config']).model_dump()):
+                raise HTTPException(409, 'Start a new conversation to change players or the default scope.')
         else:
+            mode = request.mode or 'assistant'
+            if mode != 'assistant' and request.debate_config is None:
+                raise HTTPException(400, 'Choose both players before starting Fan Debate.')
+            if mode == 'assistant' and request.debate_config is not None:
+                raise HTTPException(400, 'Debate configuration requires a Fan Debate mode.')
+            names = {}
+            if request.debate_config:
+                directory = {p['id']: p['name'] for p in NBAData(budget=12).directory()}
+                ids = (request.debate_config.supported_player, request.debate_config.opponent_player)
+                if any(i not in directory for i in ids):
+                    raise HTTPException(400, 'Select valid NBA players from the player directory.')
+                names = {str(i): directory[i] for i in ids}
             record = {"session_id": str(uuid.uuid4()), "title": request.message.strip()[:80],
-                      "messages": [{"role": "system", "content": SYSTEM_PROMPT}], "turns": []}
+                      "messages": [{"role": "system", "content": SYSTEM_PROMPT}], "turns": [],
+                      'mode': mode, 'debate_config': request.debate_config.model_dump() if request.debate_config else None,
+                      'player_names': names}
+        record['reply_tone'] = request.reply_tone or record.get('reply_tone', 'reasoned')
         messages = copy.deepcopy(record["messages"])
+        emit({'type':'session','session_id':record['session_id']})
         messages[0] = {"role": "system", "content": SYSTEM_PROMPT}
         messages.append({"role": "user", "content": request.message})
+        debate_result, failed = None, False
         try:
-            response, tool_calls = run_agent(messages)
+            if record.get('mode', 'assistant') == 'assistant':
+                response, tool_calls = run_agent(messages, on_event=emit) if on_event else run_agent(messages)
+            else:
+                response, tool_calls, debate_result, evidence, state = run_debate(
+                    messages, record['mode'], DebateConfig.model_validate(record['debate_config']),
+                    record['player_names'], evidence=record.get('evidence'), state=record.get('debate_state'), history_turns=record.get('turns', []),
+                    max_rounds=MAX_TOOL_ROUNDS, reply_tone=record['reply_tone'], **({'on_event':emit} if on_event else {}))
+                record['evidence'], record['debate_state'] = evidence, state
             response = response or "No response was returned. Please try again."
             record["messages"] = messages
         except Exception as e:
             # Keep partially completed tool calls out of future model context.
             response, tool_calls = f"Model call failed: {type(e).__name__}: {str(e)[:300]}", []
-        record["turns"].append({"message": request.message, "response": response, "tool_calls": tool_calls})
+            for call in activity:
+                if call.get('status')=='running':
+                    call.update(status='failed',result='The request stopped before this tool completed.')
+                tool_calls.append(call)
+            failed = True
+        record["turns"].append({"message": request.message, "response": response, "tool_calls": tool_calls,
+                                'debate_result': debate_result, 'failed': failed, 'reply_tone':record['reply_tone']})
         record["updated_at"] = datetime.now(timezone.utc).isoformat()
         save_history(owner, record)
-        return ChatResponse(response=response, session_id=record["session_id"], tool_calls=tool_calls)
+        return ChatResponse(response=response, session_id=record["session_id"], tool_calls=tool_calls,
+                            debate_result=debate_result, failed=failed)
 
 
 @app.post("/clear")

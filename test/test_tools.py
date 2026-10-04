@@ -6,9 +6,7 @@ import unittest
 from unittest.mock import patch
 
 import requests
-import tools
-
-
+from backend.assistant import tools
 def sample():
     team = {"id": "1", "displayName": "Alpha Aces", "abbreviation": "AAA"}
     other = {"id": "2", "displayName": "Beta Bears", "abbreviation": "BBB"}

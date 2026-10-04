@@ -1,8 +1,24 @@
 import MarkdownIt from 'markdown-it'
+import katex from 'katex'
+import texmath from 'markdown-it-texmath'
 
 // Only the parser's generated markup reaches v-html. Model-supplied HTML stays
 // escaped, and markdown-it rejects unsafe link schemes such as javascript:.
 const markdown = new MarkdownIt({ html: false, breaks: true, linkify: true })
+markdown.use(texmath, {
+  engine: {
+    renderToString(source, options) {
+      // LLMs often put metric names such as EST_POSS in text without escaping
+      // underscores. Normalize only simple text groups inside parsed math;
+      // preserve actual subscripts, escaped underscores and Markdown/code.
+      const normalized = source.replace(/\\text\{([^{}$]*)\}/g, (_match, text: string) =>
+        `\\text{${text.replace(/(?<!\\)_/g, '\\_')}}`)
+      return katex.renderToString(normalized, { ...options, macros: { ...options?.macros } })
+    },
+  } satisfies Pick<typeof katex, 'renderToString'>,
+  delimiters: ['dollars', 'brackets'],
+  katexOptions: { throwOnError: false, trust: false, maxExpand: 1000, maxSize: 20 },
+})
 
 // Photos remain in the validated ResultPanel rather than loading arbitrary
 // model-supplied image URLs. Preserve the image description as plain text.

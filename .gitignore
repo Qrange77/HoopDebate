@@ -17,3 +17,9 @@ chat_history/
 # Vue dependencies and generated production build
 frontend/node_modules/
 frontend/dist/
+
+# Historical NBA response cache
+data_cache/
+
+# Local browser verification artifacts
+.playwright-cli/

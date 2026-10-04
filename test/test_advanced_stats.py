@@ -4,8 +4,8 @@ import json
 import unittest
 from unittest.mock import patch
 
-import tools
-from advanced_stats import PLAYER_METRICS, calculate, shooting_inputs
+from backend.assistant import tools
+from backend.assistant.advanced_stats import PLAYER_METRICS, calculate, shooting_inputs
 from test.test_tools import sample
 
 

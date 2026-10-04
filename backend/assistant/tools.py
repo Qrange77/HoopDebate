@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 import requests
 from pydantic import BaseModel, ConfigDict, Field
 
-from advanced_stats import PLAYER_METRICS, TEAM_METRICS, calculate, shooting_inputs
+from backend.assistant.advanced_stats import PLAYER_METRICS, TEAM_METRICS, calculate, shooting_inputs
 
 NBA_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba"
 TOOLS = []

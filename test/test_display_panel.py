@@ -1,9 +1,7 @@
 import json
 import unittest
 from unittest.mock import patch
-import tools
-
-
+from backend.assistant import tools
 class DisplayPanelTests(unittest.TestCase):
     def test_display_preserves_supplied_data_without_fetching(self):
         panel = {'player': 'Example', 'team': 'Team', 'provisional': True,

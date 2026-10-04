@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { Plus, Search, MessageSquare, ArrowUpRight, X, History, Activity, RefreshCw, Trash2, LoaderCircle } from 'lucide-vue-next'
+import { Plus, Search, MessageSquare, X, History, RefreshCw, Trash2, LoaderCircle } from 'lucide-vue-next'
 import Button from './ui/Button.vue'
 import type { Session } from '../types'
 
@@ -48,16 +48,12 @@ function startNew() { query.value = ''; emit('new') }
         <section v-for="group in groups" :key="group.label" class="history-group">
           <h2>{{ group.label }}</h2>
           <div v-for="session in group.records" :key="session.session_id" class="menu-item history-item" :class="session.session_id === activeId ? 'menu-item-active' : 'menu-item-inactive'" :aria-busy="deletingId === session.session_id">
-            <button class="history-select" :aria-current="session.session_id === activeId ? 'page' : undefined" :title="session.title" :disabled="busy" @click="emit('select', session.session_id)"><MessageSquare :size="17" /><span>{{ session.title }}</span></button>
+            <button class="history-select" :aria-current="session.session_id === activeId ? 'page' : undefined" :title="session.title" :disabled="busy" @click="emit('select', session.session_id)"><MessageSquare :size="17" /><span><small v-if="session.mode && session.mode !== 'assistant'" class="history-mode">DEBATE · </small>{{ session.title }}</span></button>
             <button class="icon-button history-delete" :aria-label="`Delete conversation: ${session.title}`" :title="deletingId === session.session_id ? 'Deleting…' : 'Delete conversation'" :disabled="busy" @click="emit('delete', session.session_id)"><LoaderCircle v-if="deletingId === session.session_id" :size="16" class="animate-spin" /><Trash2 v-else :size="16" /></button>
           </div>
         </section>
       </template>
       <div v-else class="history-empty"><History :size="26" /><p>{{ query ? 'No matching conversations' : 'Room for your next discovery' }}</p><small>{{ query ? 'Try a different search.' : 'Your conversations will appear here after your first message.' }}</small></div>
-    </div>
-    <div class="sidebar-bottom">
-      <div class="research-note"><div class="research-icon"><Activity :size="18" /></div><div><strong>Built for the details.</strong><p>Real game data. Deeper insights.</p></div></div>
-      <div class="workspace-label"><span class="workspace-avatar">GL</span><div><strong>Personal workspace</strong><span>History linked to this browser</span></div><ArrowUpRight :size="16" /></div>
     </div>
   </aside>
 </template>

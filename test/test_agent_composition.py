@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 import app
-import tools
+from backend.assistant import tools
 from test.test_tools import sample
 
 
