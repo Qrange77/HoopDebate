@@ -10,9 +10,9 @@ TeamIntent = Literal['unrelated', 'count_only', 'individual_credit']
 
 
 class TeammatePair(CompareContext):
-    focus: Literal['key_teammates'] = 'key_teammates'
-    left_teammate_id: int = Field(gt=0)
-    right_teammate_id: int = Field(gt=0)
+    focus: Literal['key_teammates'] = Field(default='key_teammates', description='Always key_teammates: this object registers a selected pair after roster discovery.')
+    left_teammate_id: int = Field(gt=0, description='Required NBA teammate ID from left roster discovery, excluding the focal player. Discover candidates before registering this pair.')
+    right_teammate_id: int = Field(gt=0, description='Required NBA teammate ID from right roster discovery, excluding the focal player. Both sides are required to register a pair.')
     teammate_selection_reason: str = Field(min_length=1, max_length=1000,
         description='Apply the same importance criteria on both sides, name alternatives and justify this pair. For two pairs nominate both pairs before either exact lookup.')
 

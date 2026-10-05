@@ -2,6 +2,7 @@
 
 import inspect
 import json
+import logging
 import re
 import unicodedata
 from datetime import datetime
@@ -9,13 +10,15 @@ from functools import wraps
 from zoneinfo import ZoneInfo
 
 import requests
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from backend.tool_errors import tool_error, validation_error, request_error
 
-from backend.assistant.advanced_stats import PLAYER_METRICS, TEAM_METRICS, calculate, shooting_inputs
+from backend.assistant.advanced_stats import PLAYER_METRICS, TEAM_METRICS, calculate, shooting_inputs, normalize_metric
 
 NBA_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba"
 TOOLS = []
 TOOL_MAP = {}
+logger = logging.getLogger(__name__)
 PARAMETERS = {
     "panel": "Final display data copied from previous tool results: player/team, optional headshot and metrics. Each metric must be an object, e.g. PTS: {label: 'PTS', value: 26, unit: ''}, not a raw stats string. Do not invent values; include formulas, inputs, caveats and provisional status. No fetching or calculation occurs.",
     "metric": "Metric name or all (default). Player: efg_pct, ts_pct, game_score, ast_to_ratio, three_point_attempt_rate, free_throw_rate. Team additionally supports tov_pct, oreb_pct, estimated_possessions, offensive_rating, defensive_rating, net_rating, but not game_score or ast_to_ratio.",
@@ -35,31 +38,42 @@ PARAMETERS = {
 
 class LookupIssue(Exception):
     def __init__(self, message, **details):
-        self.result = {"message": message, **details}
+        action = details.pop('next_action', None)
+        if action is None:
+            if details.get('candidates'):
+                action = 'Use one of the returned full names; ask the user to clarify if the intended person/team is ambiguous.'
+            elif details.get('games'):
+                action = 'Use an event_id from games; clarify the intended game for a single-game request.'
+            elif details.get('available_stats') or details.get('available_categories'):
+                action = 'Choose a returned available statistic/category matching the request and call again.'
+            else:
+                action = 'Check the requested game, name and period with find_games, game_players or game_status as appropriate. If coverage is absent, report it as unavailable, not zero.'
+        self.result = {**tool_error('lookup_unavailable', message, action, **details), 'message': message}
+        super().__init__(message)
 
 
 class PanelMetric(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
-    label: str
-    value: float | None
-    display_value: str | None = Field(default=None, pattern=r"^\d+(?:-\d+|:\d{2}|(?:\.\d+)?%)$")
-    unit: str
-    formula: str = ""
-    inputs: dict[str, float | None] = Field(default_factory=dict)
-    estimated: bool = False
-    unavailable_reason: str | None = None
+    label: str = Field(description='Human-readable metric label copied from lookup results, e.g. PTS or True shooting percentage.')
+    value: float | None = Field(description='Numeric value copied from tool results without recalculation; null for unavailable values or when display_value carries a shooting/minutes string.')
+    display_value: str | None = Field(default=None, pattern=r"^\d+(?:-\d+|:\d{2}|(?:\.\d+)?%)$", description='Exact supplied box-score string such as 9-16, 37:12 or 50%. Use value=null; omit for ordinary numeric values.')
+    unit: str = Field(description='Unit copied from the source metric, e.g. %, ratio or points; use an empty string for a unitless box-score field.')
+    formula: str = Field(default="", description='Formula returned by the calculation tool; omit for raw stats. Do not invent a formula.')
+    inputs: dict[str, float | None] = Field(default_factory=dict, description='Named numeric calculation inputs copied from the same tool result, preserving nulls.')
+    estimated: bool = Field(default=False, description='Copy whether the source metric is an estimate; default false for raw statistics.')
+    unavailable_reason: str | None = Field(default=None, description='Reason given by the source for a null metric; omit when the value is available.')
 
 
 class PanelData(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    player: str = ""
-    team: str = ""
-    headshot: str | None = None
-    position: str | None = None
-    jersey: str | None = None
-    metrics: dict[str, PanelMetric] = Field(default_factory=dict)
-    provisional: bool = False
-    note: str = ""
+    player: str = Field(default="", description='Full player name from prior lookup results. At least player or team must be nonempty.')
+    team: str = Field(default="", description='Team name from prior lookup results. At least player or team must be nonempty.')
+    headshot: str | None = Field(default=None, description='Exact image URL supplied by the player lookup; omit if unavailable.')
+    position: str | None = Field(default=None, description='Player position copied from lookup results; omit if unavailable.')
+    jersey: str | None = Field(default=None, description='Player jersey number as a string copied from lookup results; omit if unavailable.')
+    metrics: dict[str, PanelMetric] = Field(default_factory=dict, description='Requested statistics keyed by metric code. Copy values and metadata from prior tool results; omit for a profile/photo-only request.')
+    provisional: bool = Field(default=False, description='True if the source marks these statistics as provisional, e.g. an unfinished game.')
+    note: str = Field(default="", description='Relevant source caveats for this panel, including estimates or missing coverage.')
 
 
 def nba_tool(fn):
@@ -82,10 +96,14 @@ def nba_tool(fn):
             spec["minimum"] = 1 if name == "limit" else 0
             if name == "limit":
                 spec["maximum"] = 100
+        if name == 'metric':
+            metrics = PLAYER_METRICS if fn.__name__ == 'player_advanced_stats' else TEAM_METRICS
+            spec['enum'] = ['all'] + [m[0] for m in metrics]
         properties[name] = spec
 
     @wraps(fn)
     def wrapped(*args, **kwargs):
+        prefix = "Display panel validation failed" if fn.__name__ == "display_panel" else "Tool argument validation failed"
         try:
             bound = signature.bind(*args, **kwargs)
             bound.apply_defaults()
@@ -96,13 +114,40 @@ def nba_tool(fn):
                 if name in required and isinstance(value, str) and not value.strip():
                     raise ValueError(f"{name} must not be empty.")
                 if expected is int and (value < 0 or (name == "limit" and not 1 <= value <= 100)):
-                    raise ValueError(f"Invalid {name}.")
-            result = fn(*args, **kwargs)
+                    allowed = 'from 1 to 100' if name == 'limit' else 'greater than or equal to 0'
+                    raise ValueError(f"{name} must be an integer {allowed}; received {value}.")
+                if name == 'date' and value:
+                    _day(value)
+                if name == 'metric':
+                    value = bound.arguments[name] = normalize_metric(value)
+                if 'enum' in properties[name] and value not in properties[name]['enum']:
+                    raise ValueError(f"{name} must be one of: {', '.join(properties[name]['enum'])}.")
+        except (ValueError, TypeError) as exc:
+            return json.dumps(tool_error('invalid_arguments', f'{prefix}: {exc}',
+                'Correct the named argument using the tool schema and call again.', status='revise'))
+        try:
+            return json.dumps(fn(*bound.args, **bound.kwargs), allow_nan=False)
         except LookupIssue as exc:
             result = exc.result
-        except (requests.RequestException, ValueError, KeyError, IndexError, TypeError) as exc:
-            prefix = "Display panel validation failed" if fn.__name__ == "display_panel" else "NBA lookup failed"
-            result = {"error": f"{prefix}: {exc}"}
+        except ValidationError as exc:
+            result = validation_error(exc, prefix)
+        except requests.RequestException as exc:
+            result = request_error(exc, 'ESPN')
+        except ValueError as exc:
+            if fn.__name__ == 'display_panel':
+                result = tool_error('invalid_arguments', f'{prefix}: {exc}',
+                    'Copy a player or team name and valid metric objects from prior results.', status='revise')
+            else:
+                result = tool_error('invalid_response', 'ESPN returned data that could not be interpreted.',
+                    'Retry at most once; if the response remains invalid, report unavailable data.')
+        except (KeyError, IndexError, TypeError, AttributeError):
+            logger.exception('Unexpected data structure in %s', fn.__name__)
+            result = tool_error('invalid_response', 'ESPN returned missing or malformed data.',
+                'Retry at most once; if the response remains invalid, report unavailable data rather than zero.')
+        except Exception:
+            logger.exception('Unexpected tool failure in %s', fn.__name__)
+            result = tool_error('internal_error', 'The tool could not complete because of an internal error.',
+                'Do not repeat this call unchanged. Explain that the lookup failed and use other verified evidence if available.')
         return json.dumps(result)
 
     TOOL_MAP[fn.__name__] = wrapped
@@ -117,7 +162,13 @@ def nba_tool(fn):
 def _fetch(path, **params):
     response = requests.get(f"{NBA_URL}/{path}", params=params, timeout=15)
     response.raise_for_status()
-    return response.json()
+    try:
+        data = response.json()
+    except ValueError:
+        raise LookupIssue('ESPN returned invalid JSON.', next_action='Retry at most once; if it fails again, report unavailable data.') from None
+    if not isinstance(data, dict):
+        raise LookupIssue('ESPN returned an unexpected response format.', next_action='Retry at most once; if it fails again, report unavailable data.')
+    return data
 
 
 def _normalize(value):
@@ -144,13 +195,22 @@ def _choose(items, query, entity_key):
 
 
 def _day(date):
-    return (datetime.strptime(date, "%Y-%m-%d") if date else
-            datetime.now(ZoneInfo("America/New_York"))).strftime("%Y-%m-%d")
+    if not date:
+        return datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+    try:
+        if not re.fullmatch(r'\d{4}-\d{2}-\d{2}', date):
+            raise ValueError
+        return datetime.strptime(date, "%Y-%m-%d").strftime("%Y-%m-%d")
+    except ValueError:
+        raise ValueError('date must be a real calendar date in YYYY-MM-DD format, e.g. 2026-01-15.') from None
 
 
 def _events(date, team_name):
     day = _day(date)
-    events = _fetch("scoreboard", dates=day.replace("-", ""), limit=100).get("events", [])
+    events = _fetch("scoreboard", dates=day.replace("-", ""), limit=100).get("events")
+    if not isinstance(events, list):
+        raise LookupIssue('ESPN did not return a valid game list.',
+            next_action='Retry at most once; if unavailable, report that the schedule could not be verified. Do not claim there were no games.')
     if team_name:
         teams = {}
         for event in events:
@@ -174,15 +234,23 @@ def _game(date, event_id, team_name=""):
                                       "start_time": e.get("date")} for e in events])
         event_id = events[0]["id"]
     data = _fetch("summary", event=event_id)
-    competitions = data.get("header", {}).get("competitions", [])
-    if not competitions:
+    header = data.get('header')
+    competitions = header.get('competitions') if isinstance(header, dict) else None
+    if not isinstance(competitions, list) or not competitions or not isinstance(competitions[0], dict):
         raise LookupIssue("Game data is unavailable.")
     competition = competitions[0]
+    competitors = competition.get('competitors')
+    if not isinstance(competitors, list) or len(competitors) != 2 or any(
+            not isinstance(c, dict) or not isinstance(c.get('team'), dict)
+            or not c['team'].get('id') or not c['team'].get('displayName') for c in competitors):
+        raise LookupIssue('Game participants are missing or malformed.',
+            next_action='Verify the event_id using find_games. If the summary remains incomplete, report unavailable game data.')
     if date:
         expected = _day(date)
         actual = datetime.fromisoformat(competition["date"].replace("Z", "+00:00"))
         if actual.astimezone(ZoneInfo("America/New_York")).strftime("%Y-%m-%d") != expected:
-            raise LookupIssue("The event_id does not match the requested date.")
+            raise LookupIssue("The event_id does not match the requested date.",
+                next_action='Call find_games with the requested date and use an event_id from that result.')
     if team_name:
         _choose(competition.get("competitors", []), team_name, "team")
     return data, competition
@@ -533,7 +601,7 @@ def team_advanced_stats(team_name: str, date: str = "", event_id: str = "", metr
 
 @nba_tool
 def game_players(date: str = "", event_id: str = "", team_name: str = ""):
-    """List players in one game's box score: IDs, names, teams, and did-not-play status. Optionally filter by team. No statistics or rankings; use player_advanced_stats separately for each player."""
+    """List players in one game's box score: ESPN IDs, names, teams, and did-not-play status. These IDs cannot be used in NBA historical tools; use resolve_player there. Optionally filter by team. No statistics or rankings; use player_advanced_stats separately for each player."""
     data, competition = _game(date, event_id, team_name)
     squads = data.get("boxscore", {}).get("players", [])
     expected = competition.get("competitors", [])
@@ -587,7 +655,9 @@ def display_panel(panel: dict):
 def run_tool(name: str, args: dict) -> str:
     """Dispatch only registered tools and report malformed calls without crashing."""
     if name not in TOOL_MAP:
-        return json.dumps({"error": f"Unknown tool '{name}'. Available: {list(TOOL_MAP)}"})
+        return json.dumps(tool_error('unknown_tool', f"Unknown tool '{name}'.",
+            'Choose a tool from available_tools and use its parameter schema.', status='revise', available_tools=list(TOOL_MAP)))
     if not isinstance(args, dict):
-        return json.dumps({"error": "Tool arguments must be an object."})
+        return json.dumps(tool_error('invalid_arguments', 'Tool arguments must be an object.',
+            'Provide a JSON object whose keys are the tool parameter names.', status='revise'))
     return TOOL_MAP[name](**args)

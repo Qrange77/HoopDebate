@@ -11,16 +11,16 @@ from backend.data.nba import DataUnavailable, number, provenance, season_label, 
 
 class ResearchIntent(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    argument: Literal['championships', 'record', 'playoff_appearances', 'progression', 'support']
-    target_player: int | None = Field(default=None, gt=0)
-    left_season: int | None = Field(default=None, ge=1946, le=2100)
-    right_season: int | None = Field(default=None, ge=1946, le=2100)
-    phase: Literal['Regular Season', 'Playoffs'] | None = None
+    argument: Literal['championships', 'record', 'playoff_appearances', 'progression', 'support'] = Field(description='Team-context question to investigate: titles, team record, playoff appearances, progression or supporting cast. Planning alone does not fetch the queued evidence.')
+    target_player: int | None = Field(default=None, gt=0, description='Optional focal NBA ID, restricted to the configured pair. Both players are still investigated; this does not filter the queue.')
+    left_season: int | None = Field(default=None, ge=1946, le=2100, description='Optional season START year for the configured supported player; 2017 means 2017-18. Leave null if unspecified instead of inventing a year.')
+    right_season: int | None = Field(default=None, ge=1946, le=2100, description='Optional season START year for the configured opponent; 2017 means 2017-18. Leave null if unspecified instead of inventing a year.')
+    phase: Literal['Regular Season', 'Playoffs'] | None = Field(default=None, description='Optional Regular Season or Playoffs filter. Omit/null to let the selected investigation determine the relevant phases.')
 
 
 class ResearchBatch(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    plan_id: str
+    plan_id: str = Field(description='Exact plan_id returned by plan_team_context_research. Reuse it to execute successive server-ordered batches until complete.')
 
 
 def _stints(entry, dataset):

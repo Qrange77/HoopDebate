@@ -22,6 +22,7 @@ from backend.data.nba import NBAData
 from backend.activity import ActivityLog
 from backend.model_calls import completion_with_backoff, model_error_message
 from backend.paths import PROJECT_ROOT
+from backend.tool_errors import parse_tool_arguments, tool_error
 
 # --- Config ---
 
@@ -71,7 +72,8 @@ SYSTEM_PROMPT = (
     "There is no overall best-player selection tool; do not present a category leader as an official award winner. "
     "For plays and shots, use filters and pagination; follow next_offset if the user requests all events. "
     "Injury reports and standings may be current rather than historical; preserve their dates and season labels. "
-    "If data is unavailable or a tool returns an error, explain that without fabricating a result."
+    "When a tool returns an error, follow next_action: repair invalid arguments, use returned candidates, "
+    "and respect retry limits. If data remains unavailable, explain that without fabricating a result."
 )
 MAX_TOOL_ROUNDS = 20
 
@@ -105,10 +107,16 @@ def run_agent(messages: list[dict], on_event=None) -> tuple[str, list[dict]]:
 
         # The harness, not the model, runs each tool and appends the result
         for call in reply.tool_calls:
-            args = json.loads(call.function.arguments)
-            tool_calls.start(call.function.name,args)
-            result = (research.dispatch(call.function.name, args)
-                      if call.function.name in SHARED_NAMES else run_tool(call.function.name, args))
+            args = {}
+            try:
+                args = parse_tool_arguments(call.function.arguments)
+            except ValueError as exc:
+                result = json.dumps(tool_error('invalid_arguments', str(exc),
+                    'Resend this tool call with a valid JSON object matching its parameter schema.', status='revise'))
+            else:
+                tool_calls.start(call.function.name,args)
+                result = (research.dispatch(call.function.name, args)
+                          if call.function.name in SHARED_NAMES else run_tool(call.function.name, args))
             tool_calls.append({"name": call.function.name, "args": args, "result": result})
 
             messages += [{"role": "tool", "tool_call_id": call.id, "content": result}]

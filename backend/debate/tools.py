@@ -1,6 +1,9 @@
 """Structured debate tools. All claims refer to server-owned evidence snapshots."""
 import json
+import logging
 import operator
+from pydantic import ValidationError
+from backend.tool_errors import tool_error, validation_error
 from backend.data.nba import NBAData, DataUnavailable, aggregate, season_rows, season_label, provenance, stable_id
 from backend.data.honors import AWARDS, DEFAULT_AWARDS, normalize_awards
 from backend.debate.research import ResearchIntent, ResearchBatch, plan_research, research_batch, team_result_sample
@@ -37,6 +40,7 @@ DESCRIPTIONS = {
 }
 DEBATE_TOOLS = [{'type': 'function', 'function': {'name': name, 'description': DESCRIPTIONS[name],
                  'parameters': model.model_json_schema()}} for name, model in MODELS.items()]
+logger = logging.getLogger(__name__)
 
 
 def relation(a, b):
@@ -73,19 +77,30 @@ class DebateTools:
         return record
 
     def run(self, name, args):
+        if name not in MODELS:
+            return tool_error('unknown_tool', 'Unknown debate tool.',
+                              'Choose a tool from available_tools.', available_tools=list(MODELS), status='revise')
         try:
-            if name not in MODELS:
-                raise ValueError('Unknown debate tool.')
             obj = MODELS[name].model_validate(args)
             result = getattr(self, name)(obj)
             if name in ('query_competitive_context', 'compare_competitive_context', 'query_performance_context'):
                 self.record_directed_query(name, obj, result)
             return result
-        except (ValueError, DataUnavailable, KeyError, TypeError) as exc:
-            result = {'error': str(exc)[:700], 'status': 'unavailable'}
-            if name in ('query_competitive_context','compare_competitive_context','query_performance_context') and 'obj' in locals():
-                self.record_directed_query(name, obj, result)
-            return result
+        except ValidationError as exc:
+            result = validation_error(exc, status='unavailable')
+        except ValueError as exc:
+            result = tool_error('invalid_arguments', str(exc),
+                'Correct the request using the tool schema and the stated constraint, then call again.')
+        except DataUnavailable as exc:
+            result = tool_error('data_unavailable', str(exc),
+                'Use saved verified evidence if available; otherwise report this coverage gap. Identical failed NBA requests are cached for this turn, so do not repeat them. Missing data is not zero.')
+        except Exception:
+            logger.exception('Unexpected research tool failure in %s', name)
+            result = tool_error('internal_error', 'The research tool could not process its data.',
+                'Do not repeat this call unchanged. Report unavailable evidence and continue only with verified results.')
+        if name in ('query_competitive_context','compare_competitive_context','query_performance_context') and 'obj' in locals():
+            self.record_directed_query(name, obj, result)
+        return result
 
     def record_directed_query(self, name, params, result):
         records = [result] if result.get('id') else [r for key in ('left','right') if isinstance(r := result.get(key), dict) and r.get('id')]
@@ -351,7 +366,7 @@ class DebateTools:
 
     def find_counterexamples(self, p):
         if p.metric not in METRICS or p.metric in ('GP','REL_TS'):
-            raise ValueError('Choose a supported single-game metric.')
+            raise ValueError('Choose a supported single-game metric: ' + ', '.join(m for m in METRICS if m not in ('GP', 'REL_TS')))
         data = self.query_evidence(Query(player_id=p.player_id,kind='games',scope=p.scope))
         op = {'gt':operator.gt,'gte':operator.ge,'lt':operator.lt,'lte':operator.le,'eq':operator.eq}[p.comparison]
         matches = [r for r in data['games'] if r['values'].get(p.metric,{}).get('value') is not None and op(r['values'][p.metric]['value'],p.threshold)]

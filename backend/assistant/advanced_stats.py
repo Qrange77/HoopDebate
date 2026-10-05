@@ -84,13 +84,17 @@ TEAM_METRICS = SHOOTING + [
 ]
 
 
-def calculate(inputs, definitions, metric="all"):
+def normalize_metric(metric):
     aliases = {"efg%": "efg_pct", "ts%": "ts_pct", "gmsc": "game_score",
                "ast/to": "ast_to_ratio", "3par": "three_point_attempt_rate",
                "ftr": "free_throw_rate", "tov%": "tov_pct", "oreb%": "oreb_pct",
                "ortg": "offensive_rating", "drtg": "defensive_rating", "netrtg": "net_rating"}
     key = metric.strip().casefold()
-    key = aliases.get(key, key)
+    return aliases.get(key, key)
+
+
+def calculate(inputs, definitions, metric="all"):
+    key = normalize_metric(metric)
     selected = [d for d in definitions if key == "all" or d[0] == key]
     if not selected:
         raise ValueError("Unknown metric. Available: " + ", ".join(d[0] for d in definitions))

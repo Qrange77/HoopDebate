@@ -21,24 +21,6 @@ For games, give a date and team; for historical comparisons, give the players,
 seasons, and metrics. A season starts in the named year: 2023 means 2023–24.
 Missing data is reported as unavailable, and comparisons do not determine an overall winner.
 
-### Three example queries — Assistant
-
-Send these three questions in order in the same conversation. Each follow-up
-builds on the same game, showcasing Assistant’s game-data and display tools:
-
-```text
-Find the Celtics vs. Mavericks game on June 17, 2024. Where and when was it played, which team was at home, and what was the final score? Show the score by quarter and each team’s leaders in points, rebounds, and assists.
-```
-
-```text
-For that game, show Jayson Tatum’s player profile and box score, whether he started, and his scoring efficiency with the formulas and inputs. Break down his made and missed shots by quarter, and show a player panel summarizing his performance.
-```
-
-```text
-How did his team win that game? Compare both teams’ box scores, pace, and offensive ratings, then show the scoring plays from the final five minutes of the fourth quarter. Finish with a sourced game recap and any available video links.
-```
-
-
 ## Assistant tools
 
 Each tool below is available in Assistant. Historical query and comparison tools
@@ -90,6 +72,52 @@ in the Debate workflow.
 Data coverage varies by source and era; historical-game injury reports and standings
 may reflect newer dates. Tool results preserve sources, scope, and limitations.
 
+### Assistant Mode Example Query
+
+Send these ten questions one at a time, in order, in the same conversation.
+The sequence covers game lookups, follow-up context, player panels, advanced
+statistics, shot pagination, and historical comparisons:
+
+```text
+Find the NBA game between the Cavaliers and Warriors on June 19, 2016. Tell me the final score.
+```
+
+```text
+What was the score in the fourth quarter only?
+```
+
+```text
+Show me LeBron James’s player profile and photo from that game. Don’t include statistics yet.
+```
+
+```text
+Now add his box score to the panel, keeping the same player and game.
+```
+
+```text
+What were his TS% and effective field goal percentage in that game? Show the formulas and inputs, and explain whether either calculation is estimated.
+```
+
+```text
+Compare those same two metrics with Stephen Curry’s in the same game. Report any unavailable values rather than treating them as zero.
+```
+
+```text
+Show LeBron’s first three shot attempts in the fourth quarter.
+```
+
+```text
+Show the next three, keeping the same filters.
+```
+
+```text
+Now switch to historical research. Compare LeBron and Curry’s points per game and TS% for the 2015–16 regular season. Resolve their NBA player IDs before querying.
+```
+
+```text
+Compare the same players and metrics for the playoffs of that same season. Explain the scope and any missing coverage.
+```
+
 ## Debate tools — the project’s signature feature
 
 **Fan Debate turns player comparisons into an evidence-backed conversation.** You
@@ -119,7 +147,7 @@ these five dedicated workflow tools:
 | `audit_argument` | Checks numerical claims, scopes, and comparison directions against saved evidence. |
 | `submit_argument` | Submits a draft and citations for validation before the final reply. |
 
-### Three example queries — Fan Debate
+### Debate Mode Example Query
 
 For these examples, select **LeBron James** as **Your player** and **Stephen Curry**
 as **AI’s player**. Try them as opening arguments or successive challenges:

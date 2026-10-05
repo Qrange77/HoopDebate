@@ -7,6 +7,7 @@ import litellm
 from pydantic import Field, ValidationError, model_validator
 from backend.activity import ActivityLog
 from backend.model_calls import completion_with_backoff
+from backend.tool_errors import parse_tool_arguments
 from backend.data.nba import stable_id
 from backend.debate.research import research_summary
 from backend.debate.tools import DebateTools, DEBATE_TOOLS, Params, Claim, Audit, Scope, Compare, scope_text
@@ -56,11 +57,11 @@ class ArgumentPlan(Params):
     # Extra planning notes have no execution authority. Ignore them rather than
     # spend a tool round rejecting harmless model-added labels such as "reason".
     model_config = {'extra':'ignore'}
-    team_context_reason: str = Field(default='', max_length=1000)
-    team_context_intent: TeamIntent = 'unrelated'
-    support_scope: SupportScope = 'none'
+    team_context_reason: str = Field(default='', max_length=1000, description='Explain whether team achievements or supporting talent are relevant to the latest user question.')
+    team_context_intent: TeamIntent = Field(default='unrelated', description='unrelated for non-team questions; count_only for factual team-result counts; individual_credit when discussing how team results reflect individual ability.')
+    support_scope: SupportScope = Field(default='none', description='none if no supporting-cast investigation is needed; strongest_pair for explicit strongest/named helpers; two_pairs for overall help or team-credit claims.')
     teammate_pairs: list[TeammatePair] = Field(default_factory=list, max_length=2, description='After roster discovery, register ALL one or two required pairs together BEFORE any exact selected-pair query. Empty only during discovery or when support research is unnecessary.')
-    replacement_reason: str = Field(default='', max_length=600)
+    replacement_reason: str = Field(default='', max_length=600, description='When changing an existing plan, explain the new evidence or user instruction that justifies the change. Empty for the initial plan.')
     discussion_dimension: str = Field(default='', max_length=300, description='The dimension the user is asking about, interpreted from ordered conversation with the latest explicit request taking priority.')
     target_claim: str = Field(default='', max_length=700, description='A specific falsifiable proposition to test, not prove my player is better. A logical clarification must identify the inference being limited.')
     objection: str = Field(min_length=1, max_length=500, description='Briefly identify the actual disputed inference, respecting the latest question and prior context.')
@@ -176,8 +177,8 @@ class Draft(Params):
     response: str = Field(min_length=1, max_length=6000, description='Final English comeback. Use only cited facts plus general reasoning. If revising, first seek evidence for EVERY flagged factual assertion; narrow or remove it when evidence is unavailable or does not support it; rephrasing an unsupported claim does not resolve it. Shorter is fine. Never add uncited player-specific achievements or workload/roster descriptions.')
     claims: list[Claim] = Field(default_factory=list, max_length=8, description='Advanced alternative to fact_ids. Leave EMPTY when using fact_ids. Only exact server raw claims with ev_ evidence_id and uppercase metric codes; NEVER place fact_ identifiers here.')
     fact_ids: list[str] = Field(default_factory=list, max_length=8, description='Preferred citation format: copy fact_ identifiers from the catalog. Server supplies exact claim fields. Do NOT duplicate these in claims.')
-    topic: str = Field(default='', max_length=300)
-    conceded_claim_indexes: list[int] = Field(default_factory=list, max_length=8)
+    topic: str = Field(default='', max_length=300, description='Short label for the disputed topic of this reply; omit if unnecessary.')
+    conceded_claim_indexes: list[int] = Field(default_factory=list, max_length=8, description='Zero-based indexes into the submitted claims that concede an unfavorable fact. Leave empty when no such claims are submitted.')
 
 
 class ReviewIssue(Params):
@@ -873,9 +874,7 @@ def run_debate(messages, mode, config, names, evidence=None, state=None, max_rou
                 attempt_id = f'attempt_{attempt_sequence}'
             args = {}
             try:
-                args = json.loads(call.function.arguments)
-                if not isinstance(args, dict):
-                    raise ValueError('Tool arguments must be an object.')
+                args = parse_tool_arguments(call.function.arguments)
             except (ValueError, TypeError) as exc:
                 if call.function.name == 'submit_argument':
                     result = format_failure(args, [{'field':'$','type':'invalid_json','message':'Arguments must be a valid JSON object.'}])
