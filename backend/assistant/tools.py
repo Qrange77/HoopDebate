@@ -2,6 +2,7 @@
 
 import inspect
 import json
+import re
 import unicodedata
 from datetime import datetime
 from functools import wraps
@@ -16,7 +17,7 @@ NBA_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba"
 TOOLS = []
 TOOL_MAP = {}
 PARAMETERS = {
-    "panel": "Final display data copied from previous tool results: player/team, optional headshot and metrics. Do not invent values; include formulas, inputs, caveats and provisional status. No fetching or calculation occurs.",
+    "panel": "Final display data copied from previous tool results: player/team, optional headshot and metrics. Each metric must be an object, e.g. PTS: {label: 'PTS', value: 26, unit: ''}, not a raw stats string. Do not invent values; include formulas, inputs, caveats and provisional status. No fetching or calculation occurs.",
     "metric": "Metric name or all (default). Player: efg_pct, ts_pct, game_score, ast_to_ratio, three_point_attempt_rate, free_throw_rate. Team additionally supports tov_pct, oreb_pct, estimated_possessions, offensive_rating, defensive_rating, net_rating, but not game_score or ast_to_ratio.",
     "date": "Game date YYYY-MM-DD. Defaults to today in America/New_York when event_id is omitted.",
     "event_id": "ESPN game ID returned by find_games. Can be used without date.",
@@ -41,6 +42,7 @@ class PanelMetric(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
     label: str
     value: float | None
+    display_value: str | None = Field(default=None, pattern=r"^\d+(?:-\d+|:\d{2}|(?:\.\d+)?%)$")
     unit: str
     formula: str = ""
     inputs: dict[str, float | None] = Field(default_factory=dict)
@@ -99,7 +101,8 @@ def nba_tool(fn):
         except LookupIssue as exc:
             result = exc.result
         except (requests.RequestException, ValueError, KeyError, IndexError, TypeError) as exc:
-            result = {"error": f"NBA lookup failed: {exc}"}
+            prefix = "Display panel validation failed" if fn.__name__ == "display_panel" else "NBA lookup failed"
+            result = {"error": f"{prefix}: {exc}"}
         return json.dumps(result)
 
     TOOL_MAP[fn.__name__] = wrapped
@@ -562,7 +565,19 @@ def game_players(date: str = "", event_id: str = "", team_name: str = ""):
 
 @nba_tool
 def display_panel(panel: dict):
-    """Prepare an optional visual panel for the FINAL answer only. Call after completing research, only when a visual is requested or useful for the selected final result. Pass previously retrieved data; this tool does not fetch, calculate, rank or display intermediate candidates."""
+    """Prepare a visual panel for the FINAL answer. For photos/profiles omit metrics unless the user also asks for statistics. When statistics are requested, include only those requested, copied from lookup results; reuse the same player/game profile for follow-ups. This tool does not fetch, calculate, rank or display intermediate candidates."""
+    # Accept numeric box-score values copied directly from lookup results while
+    # keeping the structured contract (and advanced-stat metadata) intact.
+    metrics = panel.get("metrics")
+    if isinstance(metrics, dict):
+        normalized = {}
+        for key, value in metrics.items():
+            if isinstance(value, str) and re.fullmatch(r"\d+(?:-\d+|:\d{2}|(?:\.\d+)?%)", value):
+                value = {"label": key, "value": None, "display_value": value, "unit": ""}
+            elif value is None or type(value) in (str, int, float):
+                value = {"label": key, "value": value, "unit": ""}
+            normalized[key] = value
+        panel = {**panel, "metrics": normalized}
     data = PanelData.model_validate(panel)
     if not data.player.strip() and not data.team.strip():
         raise ValueError("A player or team name is required for a panel.")

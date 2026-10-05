@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import litellm
 from pydantic import Field, ValidationError, model_validator
 from backend.activity import ActivityLog
+from backend.model_calls import completion_with_backoff
 from backend.data.nba import stable_id
 from backend.debate.research import research_summary
 from backend.debate.tools import DebateTools, DEBATE_TOOLS, Params, Claim, Audit, Scope, Compare, scope_text
@@ -378,7 +379,7 @@ def agent_tools(context):
 
 
 def complete(messages, **kwargs):
-    return litellm.completion(model=MODEL, vertex_location='global', messages=messages, **kwargs).choices[0].message
+    return completion_with_backoff(litellm.completion, model=MODEL, vertex_location='global', messages=messages, **kwargs).choices[0].message
 
 
 def prompt(mode, config, names, state, reply_tone='reasoned'):

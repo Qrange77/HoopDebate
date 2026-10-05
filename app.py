@@ -14,11 +14,13 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import Literal
 
-from backend.assistant.tools import TOOLS, run_tool
+from backend.assistant.tools import run_tool
+from backend.assistant.research_tools import TOOLS, SHARED_NAMES, AssistantResearchTools
 from backend.debate.tools import DebateConfig
 from backend.debate.agent import run_debate
 from backend.data.nba import NBAData
 from backend.activity import ActivityLog
+from backend.model_calls import completion_with_backoff, model_error_message
 from backend.paths import PROJECT_ROOT
 
 # --- Config ---
@@ -28,7 +30,7 @@ SYSTEM_PROMPT = (
     "Use the relevant NBA tools before reporting game facts; never invent data or event IDs. "
     "Use find_games to identify a game when needed. If multiple games or names match, "
     "ask the user to choose only for a single-game request; do not guess. Reuse the selected event_id across tools. "
-    "For comparisons or rankings, compose basic tools: find_games to identify every game in scope, "
+    "For single-game or daily comparisons or rankings, compose basic tools: find_games to identify every game in scope, "
     "game_players for each game's candidate players, then player_advanced_stats for every eligible player "
     "using the same requested metric, event_id, full player_name and team_name. "
     "For a whole-day request, examine all returned games instead of asking the user to choose one. "
@@ -39,15 +41,30 @@ SYSTEM_PROMPT = (
     "Ask for a metric when best is undefined. State scope, filters, provisional status and missing coverage. "
     "Only claim an overall maximum after checking all eligible candidates in scope; otherwise label results partial. "
     "Dates are YYYY-MM-DD; omitted dates default to today in America/New_York when no event_id is given. "
-    "Team-specific tools require team_name; player-specific tools require player_name. "
+    "Game tools use team_name/player_name. Historical research tools use NBA player IDs, "
+    "resolved using resolve_player; never substitute ESPN IDs or invent IDs. "
+    "For season/career statistics use query_evidence; for player comparisons use compare_players. "
+    "Use player_awards or compare_awards for honors, find_counterexamples for matching games, "
+    "and find_comparative_edges for metric advantages and disadvantages. "
+    "Use competitive/performance context tools for scoped teammate, role, ranking or opponent questions. "
+    "Resolve ambiguous names with the user. Players can change freely in Assistant. "
+    "Season values are starting years: 2023 means 2023-24. Preserve compatible scopes, sources and limitations. "
+    "These lookups do not declare an overall winner or run the Debate review process. "
     "Keep answers focused on the requested information. Call separate tools for separate categories. "
     "Use game_score with quarter=0 for full-game scores, 1-4 for a quarter, and 5 or higher for overtime. "
     "Use player_game_stats for player statistics and team_game_leader for a single category leader. "
     "Use player_advanced_stats for player efficiency and team_advanced_stats for team advanced metrics. "
     "Report estimate labels, provisional results, and unavailable metrics accurately; never substitute zero for missing values. "
     "Data tools never display panels automatically. For photos/profiles, retrieve data with player_info. "
-    "After completing research and comparisons, optionally call display_panel with data copied from prior tool results "
-    "only if the user requests a photo/panel or a visual helps present the selected final result. "
+    "For a photo/profile request, call display_panel with identity and photo fields only; omit metrics. "
+    "Only include statistics in a panel when the user asks for statistics, a box score, or a specific metric. "
+    "When statistics are requested, retrieve them and call display_panel for the requested player/team with those statistics. "
+    "Include only the requested metrics; a box-score request includes the available basic box score, not unrequested advanced metrics. "
+    "For follow-ups such as 'Also show his box score', reuse the player and game from conversation context, "
+    "and include their previously retrieved profile/photo together with the newly requested statistics in the follow-up panel. "
+    "Never carry statistics into a photo/profile-only request or across different players or games. "
+    "Use metric objects with label, numeric value and unit; for supplied shooting lines or minutes such as '9-16' or '37:12', "
+    "use value=null and display_value set to the exact supplied string. Do not invent or calculate display values. "
     "Do not call display_panel for intermediate candidates or every player inspected. Plain answers need no panel. "
     "Pass only the metrics needed for the final answer, preserving formula, inputs, estimates, availability, "
     "provisional status and caveats. Never invent image URLs or statistics. Then write the final answer. "
@@ -67,10 +84,11 @@ def run_agent(messages: list[dict], on_event=None) -> tuple[str, list[dict]]:
     Returns the final text and a record of every tool call made along the way.
     """
     tool_calls = ActivityLog(on_event)
+    research = AssistantResearchTools()
 
     for _ in range(MAX_TOOL_ROUNDS):
         tool_calls.phase('Preparing a reply')
-        reply = litellm.completion(
+        reply = completion_with_backoff(litellm.completion,
             model="vertex_ai/gemini-3.5-flash-lite",
             vertex_location="global",
             messages=messages,
@@ -89,7 +107,8 @@ def run_agent(messages: list[dict], on_event=None) -> tuple[str, list[dict]]:
         for call in reply.tool_calls:
             args = json.loads(call.function.arguments)
             tool_calls.start(call.function.name,args)
-            result = run_tool(call.function.name, args)
+            result = (research.dispatch(call.function.name, args)
+                      if call.function.name in SHARED_NAMES else run_tool(call.function.name, args))
             tool_calls.append({"name": call.function.name, "args": args, "result": result})
 
             messages += [{"role": "tool", "tool_call_id": call.id, "content": result}]
@@ -100,7 +119,7 @@ def run_agent(messages: list[dict], on_event=None) -> tuple[str, list[dict]]:
         "Explicitly state any unfinished coverage; do not claim a definitive winner if candidates remain unchecked. "
         "Do not request further tools."
     )}
-    reply = litellm.completion(
+    reply = completion_with_backoff(litellm.completion,
         model="vertex_ai/gemini-3.5-flash-lite", vertex_location="global",
         messages=messages + [summary_instruction], tools=TOOLS, tool_choice="none",
     ).choices[0].message
@@ -316,7 +335,7 @@ def _chat(request: ChatRequest, owner: str, on_event=None):
             record["messages"] = messages
         except Exception as e:
             # Keep partially completed tool calls out of future model context.
-            response, tool_calls = f"Model call failed: {type(e).__name__}: {str(e)[:300]}", []
+            response, tool_calls = model_error_message(e), []
             for call in activity:
                 if call.get('status')=='running':
                     call.update(status='failed',result='The request stopped before this tool completed.')

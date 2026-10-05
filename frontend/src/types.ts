@@ -3,7 +3,7 @@ export interface Turn { message: string; response: string; tool_calls: ToolCall[
 export interface Session { session_id: string; title: string; updated_at: string; mode?: ChatMode }
 export interface Conversation { session_id: string; title: string; turns: Turn[]; mode?: ChatMode; debate_config?: DebateConfig | null; player_names?: Record<string, string>; reply_tone?: ReplyTone }
 export interface Metric {
-  label: string; value: number | null; unit?: string; estimated?: boolean
+  label: string; value: number | null; display_value?: string | null; unit?: string; estimated?: boolean
   unavailable_reason?: string; formula?: string; inputs?: unknown
 }
 export interface Panel {
