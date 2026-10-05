@@ -14,9 +14,8 @@ __pycache__/
 # Local conversation history
 chat_history/
 
-# Vue dependencies and generated production build
+# Vue dependencies (frontend/dist is committed for Cloud Run deployment)
 frontend/node_modules/
-frontend/dist/
 
 # Historical NBA response cache
 data_cache/
